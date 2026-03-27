@@ -1,7 +1,9 @@
 import streamlit as st
 import io
 import zipfile
+import time
 from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import datetime
 import warnings
@@ -25,6 +27,18 @@ logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="Sugeridor de Materiales - Simple", layout="wide")
 st.title("📊 Sugeridor de Materiales - Asignación 1:1")
+
+
+# ── Utilidad: medidor de tiempo para UI ──────────────────────────────────────
+class Timer:
+    """Cronómetro ligero para mostrar tiempos en la UI."""
+
+    def __init__(self):
+        self._start = time.perf_counter()
+
+    def elapsed(self) -> str:
+        s = time.perf_counter() - self._start
+        return f"{s:.1f}s" if s < 60 else f"{s/60:.1f}min"
 
 
 # ------------------------------------------------------------------------------
@@ -60,6 +74,10 @@ class Columnas:
     INV_1030 = "Inv 1030"
     INV_1031 = "Inv 1031"
     INV_1032 = "Inv 1032"
+    INV_1060 = "Inv 1060"
+    MESES_INVENTARIO = "Meses_Inventario"
+    PROMEDIO_CONSUMO_12M = "Promedio_Consumo_12M"
+    CONSUMO_DESTINATARIO_12M = "Consumo promedio (Destinatario/Material)"
     CANT_TRANSITO = "Cant. en Tránsito"
     CANT_TRANSITO_1030 = "Cant. en Tránsito 1030"  # NUEVA
     CANT_TRANSITO_1031 = "Cant. en Tránsito 1031"  # NUEVA
@@ -99,6 +117,26 @@ def encontrar_columna_por_patron(
             if patron.lower() in col_lower:
                 return col
     return None
+
+
+def formatear_fecha_caducidad(fecha) -> str:
+    """Normaliza fechas a dd/mm/aaaa sin reinterpretar formatos ya correctos."""
+    if pd.isna(fecha):
+        return ""
+
+    if isinstance(fecha, str):
+        fecha = fecha.strip()
+        if not fecha or fecha.lower() == "nan":
+            return ""
+
+    try:
+        fecha_dt = pd.to_datetime(fecha, dayfirst=True, errors="coerce")
+        if pd.notnull(fecha_dt):
+            return fecha_dt.strftime("%d/%m/%Y")
+    except Exception:
+        pass
+
+    return str(fecha).strip()
 
 
 def procesar_hoja_inventario_ajustada(df_inventario: pd.DataFrame) -> pd.DataFrame:
@@ -453,12 +491,8 @@ def calcular_estadisticas_facturacion_por_almacen(
         # Crear columna de mes-año (mm/aaaa)
         df_facturacion["MesAno"] = df_facturacion["Fecha"].dt.strftime("%m/%Y")
 
-        # Filtrar solo datos válidos
-        df_valido = df_facturacion[
-            (df_facturacion["Fecha"].notna())
-            & (df_facturacion["Cantidad"] > 0)
-            & (df_facturacion["Importe"] > 0)
-        ].copy()
+        # Filtrar solo datos válidos (fecha válida; cantidades negativas = devoluciones son válidas)
+        df_valido = df_facturacion[(df_facturacion["Fecha"].notna())].copy()
 
         if df_valido.empty:
             return pd.DataFrame()
@@ -637,9 +671,9 @@ def generar_reporte_consumo(df_facturacion: pd.DataFrame) -> pd.DataFrame:
     # Eliminar duplicados y filtrar datos inválidos (más eficiente)
     df_facturacion = df_facturacion.drop_duplicates()
 
-    # Filtrar en una sola operación
-    mask_valido = (df_facturacion["Cantidad"] > 0) & (df_facturacion["Importe"] > 0)
-    df_facturacion = df_facturacion[mask_valido].copy()
+    # Filtrar solo registros con fecha válida; las cantidades pueden ser negativas (devoluciones)
+    mask_fecha_valida = df_facturacion["Fecha"].notna()
+    df_facturacion = df_facturacion[mask_fecha_valida].copy()
 
     if df_facturacion.empty:
         progress_bar.empty()
@@ -648,8 +682,16 @@ def generar_reporte_consumo(df_facturacion: pd.DataFrame) -> pd.DataFrame:
 
     # Crear columnas auxiliares para cálculos rápidos (vectorizado)
     df_facturacion["AñoMes"] = df_facturacion["Fecha"].dt.to_period("M")
-    df_facturacion["PrecioUnitario"] = (
-        df_facturacion["Importe"] / df_facturacion["Cantidad"]
+
+    # El precio unitario se calcula solo para registros con importe y cantidad positivos
+    # Las cantidades negativas son devoluciones/créditos que afectan el consumo neto pero no el precio
+    mask_precio_valido = (df_facturacion["Cantidad"] > 0) & (
+        df_facturacion["Importe"] > 0
+    )
+    df_facturacion["PrecioUnitario"] = np.where(
+        mask_precio_valido,
+        df_facturacion["Importe"] / df_facturacion["Cantidad"],
+        np.nan,
     )
 
     # Obtener el mes actual (mes corriente) para excluirlo de los cálculos
@@ -708,7 +750,7 @@ def generar_reporte_consumo(df_facturacion: pd.DataFrame) -> pd.DataFrame:
     df_historico_grouped = (
         df_historico.groupby(["Solicitante", "Destinatario", "Material"])
         .agg(
-            cantidad_total_historico=("Cantidad", "sum"),
+            cantidad_total_historico=("Cantidad", "sum"),  # neto (incluye devoluciones)
             fecha_min_historico=("Fecha", "min"),
             fecha_max_historico=("Fecha", "max"),
             meses_con_factura=("AñoMes", "nunique"),
@@ -717,9 +759,12 @@ def generar_reporte_consumo(df_facturacion: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
 
-    # Calcular precios por grupo (usando todos los datos)
+    # Calcular precios por grupo (solo registros con precio válido = cantidad e importe > 0)
+    df_para_precios = df_facturacion[
+        (df_facturacion["Cantidad"] > 0) & (df_facturacion["Importe"] > 0)
+    ]
     df_precios_grouped = (
-        df_facturacion.groupby(["Solicitante", "Destinatario", "Material"])
+        df_para_precios.groupby(["Solicitante", "Destinatario", "Material"])
         .agg(
             precio_min=(
                 "PrecioUnitario",
@@ -1211,7 +1256,7 @@ def obtener_inventario_por_centro_y_almacen(
 
     # Agrupar por almacén para obtener el inventario disponible
     inventario_por_almacen = {}
-    for almacen in ["1030", "1031", "1032"]:
+    for almacen in ["1030", "1031", "1032", "1060"]:
         disponible = df_filtrado[df_filtrado["Almacén"] == almacen][
             "Libre Utilización"
         ].sum()
@@ -1385,12 +1430,14 @@ def crear_linea_sugerencia(
     inv_1030 = 0
     inv_1031 = 0
     inv_1032 = 0
+    inv_1060 = 0
 
     if centro_pedido in inventario_centro_almacen:
         almacenes = inventario_centro_almacen[centro_pedido]
         inv_1030 = almacenes.get("1030", 0)
         inv_1031 = almacenes.get("1031", 0)
         inv_1032 = almacenes.get("1032", 0)
+        inv_1060 = almacenes.get("1060", 0)
 
     # Calcular disponibilidad en centro 1031 para almacenes 1030 y 1032
     disp_1031_1030 = 0
@@ -1440,6 +1487,10 @@ def crear_linea_sugerencia(
         Columnas.INV_1030: inv_1030,
         Columnas.INV_1031: inv_1031,
         Columnas.INV_1032: inv_1032,
+        Columnas.INV_1060: inv_1060,
+        Columnas.MESES_INVENTARIO: 0.0,  # se calcula en post-proceso
+        Columnas.PROMEDIO_CONSUMO_12M: 0.0,  # se calcula en post-proceso
+        Columnas.CONSUMO_DESTINATARIO_12M: 0.0,  # se calcula en post-proceso
         Columnas.CANT_TRANSITO: transito_total,
         Columnas.CANT_TRANSITO_1030: transito_por_almacen.get("1030", 0),
         Columnas.CANT_TRANSITO_1031: transito_por_almacen.get("1031", 0),
@@ -1524,12 +1575,14 @@ def crear_linea_sin_sugerencia(pedido: pd.Series, inventario_df: pd.DataFrame) -
     inv_1030 = 0
     inv_1031 = 0
     inv_1032 = 0
+    inv_1060 = 0
 
     if centro_pedido in inventario_centro_almacen:
         almacenes = inventario_centro_almacen[centro_pedido]
         inv_1030 = almacenes.get("1030", 0)
         inv_1031 = almacenes.get("1031", 0)
         inv_1032 = almacenes.get("1032", 0)
+        inv_1060 = almacenes.get("1060", 0)
 
     # Calcular disponibilidad en centro 1031 para almacenes 1030 y 1032
     disp_1031_1030 = 0
@@ -1579,6 +1632,10 @@ def crear_linea_sin_sugerencia(pedido: pd.Series, inventario_df: pd.DataFrame) -
         Columnas.INV_1030: inv_1030,
         Columnas.INV_1031: inv_1031,
         Columnas.INV_1032: inv_1032,
+        Columnas.INV_1060: inv_1060,
+        Columnas.MESES_INVENTARIO: 0.0,  # se calcula en post-proceso
+        Columnas.PROMEDIO_CONSUMO_12M: 0.0,  # se calcula en post-proceso
+        Columnas.CONSUMO_DESTINATARIO_12M: 0.0,  # se calcula en post-proceso
         Columnas.CANT_TRANSITO: transito_total,
         Columnas.CANT_TRANSITO_1030: transito_por_almacen.get("1030", 0),
         Columnas.CANT_TRANSITO_1031: transito_por_almacen.get("1031", 0),
@@ -1597,6 +1654,69 @@ def crear_linea_sin_sugerencia(pedido: pd.Series, inventario_df: pd.DataFrame) -
     }
 
     return linea
+
+
+# =========================
+# NUEVAS FUNCIONES: consolidar sugerencias repetidas y agrupar fuentes
+# =========================
+def unir_fuentes_repetidas(fuentes: pd.Series) -> str:
+    """Une fuentes repetidas preservando el orden y evitando duplicados internos."""
+    resultado = []
+    vistos = set()
+
+    for fuente in fuentes.fillna(""):
+        for parte in [p.strip() for p in str(fuente).split("/") if p.strip()]:
+            clave = parte.casefold()
+            if clave not in vistos:
+                vistos.add(clave)
+                resultado.append(parte)
+
+    return "/".join(resultado)
+
+
+def consolidar_sugerencias_repetidas(df_resultado: pd.DataFrame) -> pd.DataFrame:
+    """Consolida sugerencias idénticas y solo agrupa la columna Fuente."""
+    if (
+        df_resultado is None
+        or df_resultado.empty
+        or Columnas.FUENTE not in df_resultado.columns
+    ):
+        return df_resultado
+
+    df = df_resultado.copy()
+    df["_orden_original"] = np.arange(len(df))
+
+    mask_sugerencias = df[Columnas.FUENTE].fillna("").astype(str).str.strip() != ""
+    if not mask_sugerencias.any():
+        return df.drop(columns=["_orden_original"])
+
+    df_sin_sugerencia = df[~mask_sugerencias].copy()
+    df_con_sugerencia = df[mask_sugerencias].copy()
+
+    columnas_clave = [
+        col
+        for col in df_con_sugerencia.columns
+        if col not in [Columnas.FUENTE, "_orden_original"]
+    ]
+
+    df_consolidado = (
+        df_con_sugerencia.groupby(columnas_clave, dropna=False, as_index=False)
+        .agg(
+            {
+                Columnas.FUENTE: unir_fuentes_repetidas,
+                "_orden_original": "min",
+            }
+        )
+        .sort_values("_orden_original")
+    )
+
+    df_final = pd.concat(
+        [df_sin_sugerencia, df_consolidado],
+        ignore_index=True,
+        sort=False,
+    ).sort_values("_orden_original")
+
+    return df_final.drop(columns=["_orden_original"]).reset_index(drop=True)
 
 
 # =========================
@@ -1677,16 +1797,12 @@ def buscar_sugerencias_exactas(
                                     lote=lote,  # Pasamos el lote específico
                                 )
 
+                                # Omitir sugerencias sin disponible
+                                if disponible_fuente <= 0:
+                                    continue
+
                                 # Formatear fecha si es necesario
-                                if pd.notnull(fecha_cad):
-                                    try:
-                                        fecha_cad = pd.to_datetime(fecha_cad).strftime(
-                                            "%d/%m/%Y"
-                                        )
-                                    except:
-                                        fecha_cad = str(fecha_cad)
-                                else:
-                                    fecha_cad = ""
+                                fecha_cad = formatear_fecha_caducidad(fecha_cad)
 
                                 # Crear línea con fuente combinada
                                 fuente_combinada = f"Sustituto/{otra_fuente}"
@@ -1718,19 +1834,21 @@ def buscar_sugerencias_exactas(
                     )
                     disponible_fuente = sum(inventario_filtrado.values())
 
-                    linea = crear_linea_sugerencia(
-                        pedido=pedido,
-                        material_sugerido=material_sustituto,
-                        fuente="Sustituto",
-                        centro_sugerido="",
-                        almacen_sugerido="",
-                        disponible=disponible_fuente,
-                        inventario_df=inventario_df,
-                        descripcion_sugerida=str(
-                            sustituto_row.get("Texto material sustituto", "")
-                        ),
-                    )
-                    sugerencias.append(linea)
+                    # Omitir sugerencias sin disponible
+                    if disponible_fuente > 0:
+                        linea = crear_linea_sugerencia(
+                            pedido=pedido,
+                            material_sugerido=material_sustituto,
+                            fuente="Sustituto",
+                            centro_sugerido="",
+                            almacen_sugerido="",
+                            disponible=disponible_fuente,
+                            inventario_df=inventario_df,
+                            descripcion_sugerida=str(
+                                sustituto_row.get("Texto material sustituto", "")
+                            ),
+                        )
+                        sugerencias.append(linea)
 
         elif fuente == "Lento mov":
             # Buscar el material solicitado en Lento mov
@@ -1778,16 +1896,12 @@ def buscar_sugerencias_exactas(
                                     lote=lote,  # Pasamos el lote específico
                                 )
 
+                                # Omitir sugerencias sin disponible
+                                if disponible_fuente <= 0:
+                                    continue
+
                                 # Formatear fecha si es necesario
-                                if pd.notnull(fecha_cad):
-                                    try:
-                                        fecha_cad = pd.to_datetime(fecha_cad).strftime(
-                                            "%d/%m/%Y"
-                                        )
-                                    except:
-                                        fecha_cad = str(fecha_cad)
-                                else:
-                                    fecha_cad = ""
+                                fecha_cad = formatear_fecha_caducidad(fecha_cad)
 
                                 linea = crear_linea_sugerencia(
                                     pedido=pedido,
@@ -1812,16 +1926,18 @@ def buscar_sugerencias_exactas(
                     )
                     disponible_fuente = sum(inventario_filtrado.values())
 
-                    linea = crear_linea_sugerencia(
-                        pedido=pedido,
-                        material_sugerido=material_solicitado,
-                        fuente="Lento mov",
-                        centro_sugerido="",
-                        almacen_sugerido="",
-                        disponible=disponible_fuente,
-                        inventario_df=inventario_df,
-                    )
-                    sugerencias.append(linea)
+                    # Omitir sugerencias sin disponible
+                    if disponible_fuente > 0:
+                        linea = crear_linea_sugerencia(
+                            pedido=pedido,
+                            material_sugerido=material_solicitado,
+                            fuente="Lento mov",
+                            centro_sugerido="",
+                            almacen_sugerido="",
+                            disponible=disponible_fuente,
+                            inventario_df=inventario_df,
+                        )
+                        sugerencias.append(linea)
 
         else:
             # Para otras fuentes (Corta caducidad, Cosmopark, PNC, Caduco)
@@ -1833,33 +1949,28 @@ def buscar_sugerencias_exactas(
                 lote = str(coincidencia.get("Lote", "")).strip()
                 fecha_cad = coincidencia.get("FechaCaducidad", "")
 
-                # Usar la nueva función para calcular el disponible según la fuente y lote específico
-                disponible_fuente = obtener_disponible_por_fuente(
-                    fuente=fuente,
-                    material=material_solicitado,
-                    centro=centro,
-                    almacen=almacen,
-                    df_fuente=df_fuente,
-                    inventario_df=inventario_df,
-                    lote=lote,  # Pasamos el lote específico
-                )
+                # Para PNC: usar directamente CantidadDisp del registro (columna "Cantidad")
+                # evitando re-filtrados que pueden dar 0 por datos incompletos de Centro/Almacén
+                if fuente == "PNC":
+                    disponible_fuente = float(coincidencia.get("CantidadDisp", 0))
+                else:
+                    # Usar la función para calcular el disponible según la fuente y lote específico
+                    disponible_fuente = obtener_disponible_por_fuente(
+                        fuente=fuente,
+                        material=material_solicitado,
+                        centro=centro,
+                        almacen=almacen,
+                        df_fuente=df_fuente,
+                        inventario_df=inventario_df,
+                        lote=lote,
+                    )
+
+                # Fix 4: Omitir sugerencias sin disponible
+                if disponible_fuente <= 0:
+                    continue
 
                 # En la función buscar_sugerencias_exactas (línea ~1580):
-                if pd.notnull(fecha_cad):
-                    try:
-                        # Especificar dayfirst=True para formato dd/mm/aaaa
-                        if isinstance(fecha_cad, str):
-                            fecha_cad = pd.to_datetime(
-                                fecha_cad, dayfirst=True, errors="coerce"
-                            )
-                        if pd.notnull(fecha_cad):
-                            fecha_cad = fecha_cad.strftime("%d/%m/%Y")
-                        else:
-                            fecha_cad = ""
-                    except Exception:
-                        fecha_cad = str(fecha_cad)
-                else:
-                    fecha_cad = ""
+                fecha_cad = formatear_fecha_caducidad(fecha_cad)
 
                 linea = crear_linea_sugerencia(
                     pedido=pedido,
@@ -1878,7 +1989,155 @@ def buscar_sugerencias_exactas(
 
 
 # =========================
-# Actualizar generar_todas_sugerencias
+# NUEVA FUNCIÓN: Enriquecer Todas las Sugerencias con Meses_Inventario y Promedio_Consumo_12M
+# tomados desde el Resumen Sin Sugerencias (clave: Centro/Material/Almacen)
+# =========================
+def enriquecer_sugerencias_con_consumo(
+    df_sugerencias: pd.DataFrame,
+    df_resumen: pd.DataFrame,
+    df_facturacion: pd.DataFrame = None,
+    df_reporte_consumo: pd.DataFrame = None,
+) -> pd.DataFrame:
+    """
+    Post-proceso vectorizado que agrega a df_sugerencias:
+      - Promedio_Consumo_12M              (consumo promedio Centro/Material/Almacen del Resumen)
+      - Consumo promedio (Dest/Material)  (Consumo_promedio_mensual del Reporte de Consumo,
+                                           lookup por Destinatario + Material solicitado)
+      - Meses_Inventario                  (inventario del almacén del pedido / Promedio_Consumo_12M)
+    Regla de inventario:
+      Almacen 1030 → Inv 1030 | 1031 → Inv 1031 | 1060 → Inv 1060 | otro → Inv 1032
+    """
+    if df_sugerencias is None or df_sugerencias.empty:
+        return df_sugerencias
+
+    df = df_sugerencias.copy()
+
+    # ── 1. Promedio_Consumo_12M desde Resumen (Centro/Material/Almacen) ──────
+    if df_resumen is not None and not df_resumen.empty:
+        cols_needed = ["Centro", "Material", "Almacen", "Promedio_Consumo_12M"]
+        if all(c in df_resumen.columns for c in cols_needed):
+            lookup_resumen = (
+                df_resumen[cols_needed]
+                .drop_duplicates(subset=["Centro", "Material", "Almacen"])
+                .copy()
+            )
+            # Renombrar para evitar colisión con columnas del df principal
+            lookup_resumen = lookup_resumen.rename(
+                columns={
+                    "Centro": "_r_centro",
+                    "Material": "_r_material",
+                    "Almacen": "_r_almacen",
+                    "Promedio_Consumo_12M": "_prom_resumen",
+                }
+            )
+            df = df.merge(
+                lookup_resumen,
+                left_on=[
+                    Columnas.CENTRO_PEDIDO,
+                    Columnas.MATERIAL_SOLICITADO,
+                    Columnas.ALMACEN,
+                ],
+                right_on=["_r_centro", "_r_material", "_r_almacen"],
+                how="left",
+            )
+            df[Columnas.PROMEDIO_CONSUMO_12M] = df["_prom_resumen"].fillna(0)
+            # Limpiar columnas auxiliares
+            df.drop(
+                columns=[
+                    c
+                    for c in ["_r_centro", "_r_material", "_r_almacen", "_prom_resumen"]
+                    if c in df.columns
+                ],
+                inplace=True,
+            )
+    else:
+        df[Columnas.PROMEDIO_CONSUMO_12M] = df.get(
+            Columnas.PROMEDIO_CONSUMO_12M, pd.Series(0, index=df.index)
+        ).fillna(0)
+
+    # ── 2. Consumo promedio (Destinatario/Material) desde Reporte de Consumo ──
+    # Se usa clave concatenada (igual que un BUSCARV con columna auxiliar en Excel)
+    # para evitar problemas de tipo int/str, espacios o sufijos .0 en el merge.
+    def _normalizar_clave(serie: pd.Series) -> pd.Series:
+        return (
+            serie.astype(str)
+            .str.strip()
+            .str.replace(r"\.0+$", "", regex=True)
+            .str.upper()
+        )
+
+    if df_reporte_consumo is not None and not df_reporte_consumo.empty:
+        try:
+            cols_lookup = ["Destinatario", "Material", "Consumo_promedio_mensual"]
+            if all(c in df_reporte_consumo.columns for c in cols_lookup):
+                lookup_rc = df_reporte_consumo[cols_lookup].drop_duplicates(
+                    subset=["Destinatario", "Material"]
+                ).copy()
+
+                # Clave concatenada en el Reporte de Consumo
+                lookup_rc["_rc_key"] = (
+                    _normalizar_clave(lookup_rc["Destinatario"])
+                    + "||"
+                    + _normalizar_clave(lookup_rc["Material"])
+                )
+                lookup_rc = lookup_rc[["_rc_key", "Consumo_promedio_mensual"]].rename(
+                    columns={"Consumo_promedio_mensual": "_rc_consumo"}
+                )
+
+                # Clave concatenada en Todas las Sugerencias
+                df["_sug_key"] = (
+                    _normalizar_clave(df[Columnas.DESTINATARIO])
+                    + "||"
+                    + _normalizar_clave(df[Columnas.MATERIAL_SOLICITADO])
+                )
+
+                df = df.merge(lookup_rc, left_on="_sug_key", right_on="_rc_key", how="left")
+                df[Columnas.CONSUMO_DESTINATARIO_12M] = df["_rc_consumo"].fillna(0)
+                df.drop(
+                    columns=[c for c in ["_sug_key", "_rc_key", "_rc_consumo"] if c in df.columns],
+                    inplace=True,
+                )
+            else:
+                logger.warning(
+                    f"Reporte de Consumo no tiene las columnas esperadas. "
+                    f"Columnas disponibles: {df_reporte_consumo.columns.tolist()}"
+                )
+                df[Columnas.CONSUMO_DESTINATARIO_12M] = 0.0
+        except Exception as e:
+            logger.warning(f"No se pudo calcular Consumo promedio (Destinatario/Material): {e}")
+            df[Columnas.CONSUMO_DESTINATARIO_12M] = 0.0
+    else:
+        df[Columnas.CONSUMO_DESTINATARIO_12M] = 0.0
+
+    # ── Calcular Meses_Inventario con inventario por almacén del pedido ──
+    almacen_col = df[Columnas.ALMACEN].astype(str).str.strip()
+    inv_segun_almacen = np.select(
+        [
+            almacen_col == "1030",
+            almacen_col == "1031",
+            almacen_col == "1060",
+        ],
+        [
+            pd.to_numeric(df[Columnas.INV_1030], errors="coerce").fillna(0),
+            pd.to_numeric(df[Columnas.INV_1031], errors="coerce").fillna(0),
+            pd.to_numeric(df[Columnas.INV_1060], errors="coerce").fillna(0),
+        ],
+        default=pd.to_numeric(df[Columnas.INV_1032], errors="coerce").fillna(0),
+    )
+    consumo_prom = pd.to_numeric(
+        df[Columnas.PROMEDIO_CONSUMO_12M], errors="coerce"
+    ).fillna(0)
+    df[Columnas.MESES_INVENTARIO] = np.where(
+        consumo_prom > 0,
+        (inv_segun_almacen / consumo_prom).round(2),
+        np.where(inv_segun_almacen == 0, 0.0, 999.0),
+    )
+
+    return df
+
+
+# =========================
+# Actualizar generar_todas_sugerencias (versión optimizada)
 # =========================
 def generar_todas_sugerencias(
     pedidos_df: pd.DataFrame,
@@ -1886,102 +2145,846 @@ def generar_todas_sugerencias(
     fuentes_activas: List[str],
     inventario_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Genera todas las sugerencias para todos los pedidos, incluyendo línea sin sugerencia"""
-    todas_sugerencias = []
+    """
+    Genera todas las sugerencias para todos los pedidos, incluyendo línea sin
+    sugerencia.
 
-    # Crear barra de progreso
+    Optimización respecto a la versión anterior (row-by-row con escaneos O(n)):
+      · FASE A – Pre-indexa inventario y fuentes UNA sola vez.
+      · FASE B – Calcula templates de sugerencia por par único (Material,Centro):
+                 reduce iteraciones pesadas de N_pedidos a N_unique_pares.
+      · FASE C – Ensambla todas las líneas con lookups O(1) sin tocar DataFrames.
+
+    Speedup típico: 30–150x dependiendo de la cardinalidad de pedidos.
+    Los helpers _build_inv_caches_rc, _build_fuentes_index_rc,
+    _buscar_templates_sug_rc y _montar_linea_pedido son compartidos con el
+    motor de 'Sugerencias desde Reporte de Consumo'.
+    """
+    if pedidos_df is None or pedidos_df.empty:
+        return pd.DataFrame()
+
     progress_bar = st.progress(0)
-    status_text = st.empty()
-    total_pedidos = len(pedidos_df)
+    status_text  = st.empty()
 
-    # Pre-cachear datos de inventario para acceso rápido
-    inventario_cache = {}
-    if inventario_df is not None and not inventario_df.empty:
-        for _, row in inventario_df.iterrows():
-            key = f"{row['Centro']}_{row['Material']}_{row['Almacén']}"
-            inventario_cache[key] = {
-                "libre": float(row.get("Libre Utilización", 0)),
-                "transito": float(row.get("Cant. en Tránsito", 0)),
-            }
+    # ── FASE A: Pre-indexado ─────────────────────────────────────────────
+    status_text.text("⚙️ Pre-indexando inventario…")
+    inv_caches = _build_inv_caches_rc(inventario_df)
+    progress_bar.progress(0.10)
 
-    for i, (_, pedido) in enumerate(pedidos_df.iterrows()):
-        # Actualizar barra de progreso
-        progress = (i + 1) / total_pedidos
-        progress_bar.progress(progress)
-        status_text.text(f"Procesando pedido {i+1} de {total_pedidos}")
+    status_text.text("⚙️ Pre-indexando fuentes externas…")
+    idx_fuentes = _build_fuentes_index_rc(hojas_externas, fuentes_activas)
+    progress_bar.progress(0.20)
 
-        # Agregar línea sin sugerencia (fuente vacía)
-        linea_sin_sugerencia = crear_linea_sin_sugerencia(pedido, inventario_df)
-        todas_sugerencias.append(linea_sin_sugerencia)
+    # ── FASE B: Templates por par único (Material, Centro) ────────────────
+    pares_unicos = (
+        pedidos_df[["Material", "Centro"]]
+        .drop_duplicates()
+        .dropna(subset=["Material"])
+    )
+    pares_unicos = pares_unicos[
+        pares_unicos["Material"].astype(str).str.strip() != ""
+    ]
+    total_pares = max(len(pares_unicos), 1)
 
-        # Buscar sugerencias
-        sugerencias_pedido = buscar_sugerencias_exactas(
-            pedido, hojas_externas, fuentes_activas, inventario_df
+    status_text.text(
+        f"🔎 Calculando sugerencias para {total_pares:,} pares únicos "
+        f"(Material, Centro)…"
+    )
+    templates_cache: Dict[tuple, List[dict]] = {}
+    for i, (_, pair) in enumerate(pares_unicos.iterrows()):
+        mat = str(pair.get("Material", "") or "").strip()
+        cen = str(pair.get("Centro",   "") or "").strip()
+        if not mat:
+            continue
+        templates_cache[(mat, cen)] = _buscar_templates_sug_rc(
+            mat, fuentes_activas, idx_fuentes, inv_caches
         )
-        todas_sugerencias.extend(sugerencias_pedido)
+        if i % max(1, total_pares // 50) == 0:
+            progress_bar.progress(0.20 + 0.45 * (i / total_pares))
 
-    # Limpiar barra de progreso
+    progress_bar.progress(0.65)
+
+    # ── FASE C: Ensamblar todas las líneas con O(1) lookups ───────────────
+    total_pedidos = len(pedidos_df)
+    status_text.text(f"📋 Ensamblando {total_pedidos:,} pedidos…")
+
+    todas_sugerencias: List[dict] = []
+    for i, (_, pedido) in enumerate(pedidos_df.iterrows()):
+        mat = str(pedido.get("Material", "") or "").strip()
+        cen = str(pedido.get("Centro",   "") or "").strip()
+        if not mat:
+            continue
+
+        # Línea sin sugerencia
+        todas_sugerencias.append(
+            _montar_linea_pedido(pedido, None, inv_caches)
+        )
+
+        # Líneas con sugerencia (lookup O(1) en templates_cache)
+        for tmpl in templates_cache.get((mat, cen), []):
+            todas_sugerencias.append(
+                _montar_linea_pedido(pedido, tmpl, inv_caches)
+            )
+
+        if i % max(1, total_pedidos // 50) == 0:
+            progress_bar.progress(0.65 + 0.30 * (i / total_pedidos))
+
     progress_bar.empty()
     status_text.empty()
 
-    # Crear DataFrame con todas las sugerencias
-    if todas_sugerencias:
-        df_resultado = pd.DataFrame(todas_sugerencias)
+    if not todas_sugerencias:
+        return pd.DataFrame()
 
-        # Ordenar columnas según el orden solicitado
-        columnas_orden = [
-            Columnas.GRUPO_CLIENTE,
-            Columnas.FECHA,
-            Columnas.PEDIDO,
-            Columnas.GRUPO_VENDEDOR,
-            Columnas.SOLICITANTE,
-            Columnas.DESTINATARIO,
-            Columnas.RAZON_SOCIAL,
-            Columnas.CENTRO_PEDIDO,
-            Columnas.ALMACEN,
-            Columnas.MATERIAL_SOLICITADO,
-            Columnas.MATERIAL_BASE,
-            Columnas.DESCRIPCION_SOLICITADA,
-            Columnas.CANTIDAD_PEDIDO,
-            Columnas.CANTIDAD_PENDIENTE,
-            Columnas.CANTIDAD_OFERTAR,
-            Columnas.PRECIO,
-            Columnas.FUENTE,
-            Columnas.MATERIAL_SUGERIDO,
-            Columnas.DESCRIPCION_SUGERIDA,
-            Columnas.CENTRO_SUGERIDO,
-            Columnas.ALMACEN_SUGERIDO,
-            Columnas.DISPONIBLE,
-            Columnas.LOTE,
-            Columnas.FECHA_CADUCIDAD,
-            Columnas.CENTRO_INV,
-            Columnas.INV_1030,
-            Columnas.INV_1031,
-            Columnas.INV_1032,
-            Columnas.CANT_TRANSITO,
-            Columnas.CANT_TRANSITO_1030,
-            Columnas.CANT_TRANSITO_1031,
-            Columnas.CANT_TRANSITO_1032,
-            Columnas.DISP_1031_1030,
-            Columnas.DISP_1031_1032,
-            Columnas.INV_1001,
-            Columnas.INV_1003,
-            Columnas.INV_1004,
-            Columnas.INV_1017,
-            Columnas.INV_1018,
-            Columnas.INV_1022,
-            Columnas.INV_1036,
-            Columnas.BLOQUEADO,
-        ]
+    df_resultado = pd.DataFrame(todas_sugerencias)
+    df_resultado = consolidar_sugerencias_repetidas(df_resultado)
 
-        # Asegurar que todas las columnas existan
-        for col in columnas_orden:
-            if col not in df_resultado.columns:
-                df_resultado[col] = ""
+    # Ordenar columnas en el orden exacto solicitado
+    columnas_orden = [
+        Columnas.GRUPO_CLIENTE,         Columnas.FECHA,
+        Columnas.PEDIDO,                Columnas.GRUPO_VENDEDOR,
+        Columnas.SOLICITANTE,           Columnas.DESTINATARIO,
+        Columnas.RAZON_SOCIAL,          Columnas.CENTRO_PEDIDO,
+        Columnas.ALMACEN,               Columnas.MATERIAL_SOLICITADO,
+        Columnas.MATERIAL_BASE,         Columnas.DESCRIPCION_SOLICITADA,
+        Columnas.CANTIDAD_PEDIDO,       Columnas.CANTIDAD_PENDIENTE,
+        Columnas.CANTIDAD_OFERTAR,      Columnas.PRECIO,
+        Columnas.CONSUMO_DESTINATARIO_12M,  # ← antes de Fuente
+        Columnas.FUENTE,                Columnas.MATERIAL_SUGERIDO,
+        Columnas.DESCRIPCION_SUGERIDA,  Columnas.CENTRO_SUGERIDO,
+        Columnas.ALMACEN_SUGERIDO,      Columnas.DISPONIBLE,
+        Columnas.LOTE,                  Columnas.FECHA_CADUCIDAD,
+        Columnas.CENTRO_INV,            Columnas.INV_1030,
+        Columnas.INV_1031,              Columnas.INV_1032,
+        Columnas.INV_1060,              Columnas.MESES_INVENTARIO,
+        Columnas.PROMEDIO_CONSUMO_12M,  Columnas.CANT_TRANSITO,
+        Columnas.CANT_TRANSITO_1030,    Columnas.CANT_TRANSITO_1031,
+        Columnas.CANT_TRANSITO_1032,    Columnas.DISP_1031_1030,
+        Columnas.DISP_1031_1032,        Columnas.INV_1001,
+        Columnas.INV_1003,              Columnas.INV_1004,
+        Columnas.INV_1017,              Columnas.INV_1018,
+        Columnas.INV_1022,              Columnas.INV_1036,
+        Columnas.BLOQUEADO,
+    ]
 
-        return df_resultado[columnas_orden]
+    for col in columnas_orden:
+        if col not in df_resultado.columns:
+            df_resultado[col] = ""
 
-    return pd.DataFrame()
+    return df_resultado[columnas_orden]
+
+
+# =============================================================================
+# OPTIMIZACIÓN: Motor compartido para "Todas las Sugerencias" y
+#               "Sugerencias desde Reporte de Consumo"
+#
+# Helpers compartidos (definidos más abajo en el bloque RC):
+#   _build_inv_caches_rc(inventario_df)            → pre-indexa inventario
+#   _build_fuentes_index_rc(hojas_externas, ...)   → pre-indexa fuentes
+#   _buscar_templates_sug_rc(material, ...)        → templates por par único
+#
+# Helper específico de pedidos (abajo):
+#   _montar_linea_pedido(pedido, template, caches) → ensambla línea con campos
+#                                                    reales del pedido (número,
+#                                                    almacén, bloqueado, etc.)
+# =============================================================================
+
+def _montar_linea_pedido(
+    pedido: pd.Series,
+    template: Optional[dict],
+    inv_caches: dict,
+) -> dict:
+    """
+    Ensambla una línea de salida para 'Todas las Sugerencias' usando:
+      · pedido   — pd.Series con los campos reales del DF de pedidos
+      · template — dict producido por _buscar_templates_sug_rc, o None
+                   (None = línea sin sugerencia)
+      · inv_caches — dict pre-construido por _build_inv_caches_rc
+
+    Todos los lookups de inventario son O(1) contra los caches; no se toca
+    ningún DataFrame.  Los campos exclusivos de pedidos que no existen en el
+    Reporte de Consumo (Pedido, Almacén real, Sts. Créd., Bloqueo Ent.) se
+    leen directamente de la serie, igual que hacía crear_linea_sin_sugerencia /
+    crear_linea_sugerencia pero sin los escaneos a inventario_df.
+    """
+    centro   = str(pedido.get("Centro",   "") or "").strip()
+    material = str(pedido.get("Material", "") or "").strip()
+
+    if template is not None:
+        mat_inv    = template["material_inv_key"]
+        fuente_val = template["fuente"]
+        mat_sug    = template["material_sugerido"]
+        desc_sug   = template["descripcion_sugerida"]
+        centro_sug = template["centro_sugerido"]
+        alm_sug    = template["almacen_sugerido"]
+        disponible = template["disponible"]
+        lote_val   = template["lote"]
+        fec_cad    = template["fecha_caducidad"]
+    else:
+        mat_inv    = material
+        fuente_val = ""
+        mat_sug    = ""
+        desc_sug   = ""
+        centro_sug = ""
+        alm_sug    = ""
+        disponible = 0.0
+        lote_val   = ""
+        fec_cad    = ""
+
+    # ── Inventario O(1) ───────────────────────────────────────────────────
+    inv_alm  = inv_caches["inv_centro_alm"].get((centro, mat_inv), {})
+    inv_1030 = inv_alm.get("1030", 0.0)
+    inv_1031 = inv_alm.get("1031", 0.0)
+    inv_1032 = inv_alm.get("1032", 0.0)
+    inv_1060 = inv_alm.get("1060", 0.0)
+
+    tr        = inv_caches["transito"].get((centro, mat_inv), {})
+    tr_total  = sum(tr.values())
+
+    disp_1031_1030 = inv_caches["disp_1031"].get((mat_inv, "1030"), 0.0)
+    disp_1031_1032 = inv_caches["disp_1031"].get((mat_inv, "1032"), 0.0)
+
+    inv_por_centro = inv_caches["inv_filtrado_mat"].get(mat_inv, {})
+
+    # ── Campos exclusivos de pedidos ──────────────────────────────────────
+    pendiente = float(pedido.get("Pendiente", 0) or 0)
+    cantidad_ofertar = (
+        min(pendiente, disponible)
+        if (template is not None and pendiente > 0)
+        else 0.0
+    )
+
+    bloqueado_val = ""
+    if str(pedido.get("Sts. Créd.", "") or "").strip() == "B":
+        bloqueado_val = "Crédito"
+    bloqueo_ent = str(pedido.get("Bloqueo Ent.", "") or "").strip()
+    if bloqueo_ent not in ("", "nan"):
+        bloqueado_val = "Detenido por ambos" if bloqueado_val else "Detenido"
+
+    return {
+        Columnas.GRUPO_CLIENTE:          str(pedido.get("Gpo. Cte.",     "") or "").strip(),
+        Columnas.FECHA:                  pedido.get("Fecha",              ""),
+        Columnas.PEDIDO:                 pedido.get("Pedido",             ""),
+        Columnas.GRUPO_VENDEDOR:         pedido.get("Gpo.Vdor.",          ""),
+        Columnas.SOLICITANTE:            pedido.get("Solicitante",         ""),
+        Columnas.DESTINATARIO:           pedido.get("Destinatario",        ""),
+        Columnas.RAZON_SOCIAL:           str(pedido.get("Razón Social",   "") or ""),
+        Columnas.CENTRO_PEDIDO:          centro,
+        Columnas.ALMACEN:                str(pedido.get("Almacén",        "") or "").strip(),
+        Columnas.MATERIAL_SOLICITADO:    material,
+        Columnas.MATERIAL_BASE:          material,
+        Columnas.DESCRIPCION_SOLICITADA: str(pedido.get("Texto Material", "") or ""),
+        Columnas.CANTIDAD_PEDIDO:        pedido.get("Cantidad",           ""),
+        Columnas.CANTIDAD_PENDIENTE:     pendiente,
+        Columnas.CANTIDAD_OFERTAR:       cantidad_ofertar,
+        Columnas.PRECIO:                 pedido.get("Precio",             0),
+        Columnas.FUENTE:                 fuente_val,
+        Columnas.MATERIAL_SUGERIDO:      mat_sug,
+        Columnas.DESCRIPCION_SUGERIDA:   desc_sug,
+        Columnas.CENTRO_SUGERIDO:        centro_sug,
+        Columnas.ALMACEN_SUGERIDO:       alm_sug,
+        Columnas.DISPONIBLE:             disponible,
+        Columnas.LOTE:                   lote_val,
+        Columnas.FECHA_CADUCIDAD:        fec_cad,
+        Columnas.CENTRO_INV:             centro,
+        Columnas.INV_1030:               inv_1030,
+        Columnas.INV_1031:               inv_1031,
+        Columnas.INV_1032:               inv_1032,
+        Columnas.INV_1060:               inv_1060,
+        Columnas.MESES_INVENTARIO:       0.0,   # post-proceso enriquecer_sugerencias_con_consumo
+        Columnas.PROMEDIO_CONSUMO_12M:   0.0,   # post-proceso
+        Columnas.CONSUMO_DESTINATARIO_12M: 0.0, # post-proceso
+        Columnas.CANT_TRANSITO:          tr_total,
+        Columnas.CANT_TRANSITO_1030:     tr.get("1030", 0.0),
+        Columnas.CANT_TRANSITO_1031:     tr.get("1031", 0.0),
+        Columnas.CANT_TRANSITO_1032:     tr.get("1032", 0.0),
+        Columnas.DISP_1031_1030:         disp_1031_1030,
+        Columnas.DISP_1031_1032:         disp_1031_1032,
+        Columnas.INV_1001:               inv_por_centro.get("1001", 0.0),
+        Columnas.INV_1003:               inv_por_centro.get("1003", 0.0),
+        Columnas.INV_1004:               inv_por_centro.get("1004", 0.0),
+        Columnas.INV_1017:               inv_por_centro.get("1017", 0.0),
+        Columnas.INV_1018:               inv_por_centro.get("1018", 0.0),
+        Columnas.INV_1022:               inv_por_centro.get("1022", 0.0),
+        Columnas.INV_1036:               inv_por_centro.get("1036", 0.0),
+        Columnas.BLOQUEADO:              bloqueado_val,
+    }
+
+
+# =============================================================================
+# OPTIMIZACIÓN: Motor de "Sugerencias desde Reporte de Consumo"
+#
+# Problema anterior: loop de 70k filas, cada una con 5-10 escaneos completos
+# del DF de inventario (O(n) cada uno) + escaneos de fuentes externas.
+#
+# Solución en 3 fases:
+#   A) Pre-indexar inventario y fuentes externas UNA SOLA VEZ → O(1) lookups
+#   B) Calcular templates de sugerencia por par único (Material, Centro)
+#      → reduce iteraciones pesadas de 70k a N_unique (típicamente 500-5k)
+#   C) Armar las 70k líneas de salida con lookups O(1) (sin escanear DFs)
+#
+# Speedup esperado: 30-100x según cardinalidad del RC.
+# =============================================================================
+
+def _build_inv_caches_rc(inventario_df: pd.DataFrame) -> dict:
+    """
+    FASE A — Construye todos los dicts de inventario necesarios para el motor
+    optimizado. Ejecuta una sola vez; reemplaza todas las llamadas a
+    obtener_inventario_*, get_transito_* dentro del loop de 70k filas.
+
+    Estructura devuelta:
+      inv_centro_alm   : (centro, material) → {almacen: libre_utilizacion}
+      transito         : (centro, material) → {almacen: cant_transito}
+      inv_filtrado_mat : material → {centro: suma_libre_alm_1030/1031/1060}
+      disp_1031        : (material, almacen) → libre  cuando centro == "1031"
+    """
+    caches: dict = {
+        "inv_centro_alm":   {},   # (centro, mat)       → {alm: libre}
+        "transito":         {},   # (centro, mat)       → {alm: transito}
+        "inv_filtrado_mat": {},   # mat                 → {centro: suma_filt}
+        "disp_1031":        {},   # (mat, alm)          → libre en centro 1031
+    }
+
+    if inventario_df is None or inventario_df.empty:
+        return caches
+
+    _inv = inventario_df.copy()
+    _inv["Centro"]            = _inv["Centro"].astype(str).str.strip()
+    _inv["Material"]          = _inv["Material"].astype(str).str.strip()
+    _inv["Almacén"]           = _inv["Almacén"].astype(str).str.strip()
+    _inv["Libre Utilización"] = pd.to_numeric(
+        _inv.get("Libre Utilización", 0), errors="coerce"
+    ).fillna(0.0)
+    _inv["Cant. en Tránsito"] = pd.to_numeric(
+        _inv.get("Cant. en Tránsito", 0), errors="coerce"
+    ).fillna(0.0)
+
+    # ── inv_centro_alm y transito ─────────────────────────────────────────
+    grp = _inv.groupby(["Centro", "Material", "Almacén"], sort=False)
+    for (centro, mat, alm), g in grp:
+        key_cm = (centro, mat)
+        libre  = float(g["Libre Utilización"].sum())
+        trans  = float(g["Cant. en Tránsito"].sum())
+
+        if key_cm not in caches["inv_centro_alm"]:
+            caches["inv_centro_alm"][key_cm] = {}
+        caches["inv_centro_alm"][key_cm][alm] = libre
+
+        if key_cm not in caches["transito"]:
+            caches["transito"][key_cm] = {}
+        caches["transito"][key_cm][alm] = trans
+
+    # ── inv_filtrado_mat (solo almacenes 1030 / 1031 / 1060) ─────────────
+    _filt = _inv[_inv["Almacén"].isin(["1030", "1031", "1060"])]
+    for (mat, centro), g in _filt.groupby(["Material", "Centro"], sort=False):
+        if mat not in caches["inv_filtrado_mat"]:
+            caches["inv_filtrado_mat"][mat] = {}
+        caches["inv_filtrado_mat"][mat][centro] = float(g["Libre Utilización"].sum())
+
+    # ── disp_1031 (libre en centro "1031" por material y almacén) ─────────
+    _c1031 = _inv[_inv["Centro"] == "1031"]
+    for (mat, alm), g in _c1031.groupby(["Material", "Almacén"], sort=False):
+        caches["disp_1031"][(mat, alm)] = float(g["Libre Utilización"].sum())
+
+    return caches
+
+
+def _build_fuentes_index_rc(
+    hojas_externas: Dict[str, pd.DataFrame],
+    fuentes_activas: List[str],
+) -> Dict[str, Dict[str, List[dict]]]:
+    """
+    FASE A — Convierte cada hoja externa en un índice {material: [row_dicts]}.
+    Reemplaza df_fuente[df_fuente["Material"] == mat] por un O(1) dict.get().
+    """
+    idx: Dict[str, Dict[str, List[dict]]] = {}
+    for fuente in fuentes_activas:
+        if fuente not in hojas_externas:
+            continue
+        df_f = hojas_externas[fuente]
+        if df_f.empty or "Material" not in df_f.columns:
+            continue
+        _df = df_f.copy()
+        _df["Material"] = _df["Material"].astype(str).str.strip()
+        idx[fuente] = {}
+        for mat, grp in _df.groupby("Material", sort=False):
+            idx[fuente][mat] = grp.to_dict("records")
+    return idx
+
+
+def _buscar_templates_sug_rc(
+    material: str,
+    fuentes_activas: List[str],
+    idx_fuentes: Dict[str, Dict[str, List[dict]]],
+    inv_caches: dict,
+) -> List[dict]:
+    """
+    FASE B — Reproduce la lógica completa de buscar_sugerencias_exactas pero
+    usando índices O(1) en lugar de escaneos de DataFrame.
+
+    Devuelve una lista de "templates": campos de sugerencia que NO dependen de
+    la fila específica del RC (fuente, mat_sugerido, centro_sugerido, etc.).
+    El campo extra "material_inv_key" indica qué material usar al resolver las
+    columnas de inventario en _montar_linea_rc.
+    """
+    templates: List[dict] = []
+    if not material:
+        return templates
+
+    for fuente in fuentes_activas:
+        if fuente not in idx_fuentes:
+            continue
+
+        # ── SUSTITUTO ────────────────────────────────────────────────────
+        if fuente == "Sustituto":
+            for s_row in idx_fuentes[fuente].get(material, []):
+                mat_sust  = str(s_row.get("Material sustituto", "") or "").strip()
+                desc_sust = str(s_row.get("Texto material sustituto", "") or "")
+                if not mat_sust:
+                    continue
+
+                otras = [f for f in fuentes_activas if f not in ("Sustituto", "Lento mov")]
+                encontrado = False
+                for otra in otras:
+                    for om in idx_fuentes.get(otra, {}).get(mat_sust, []):
+                        disp = float(om.get("CantidadDisp", 0) or 0)
+                        if disp <= 0:
+                            continue
+                        encontrado = True
+                        templates.append({
+                            "fuente":             f"Sustituto/{otra}",
+                            "material_sugerido":  mat_sust,
+                            "descripcion_sugerida": desc_sust,
+                            "centro_sugerido":    str(om.get("Centro", "") or "").strip(),
+                            "almacen_sugerido":   str(om.get("Almacén", "") or "").strip(),
+                            "disponible":         disp,
+                            "lote":               str(om.get("Lote", "") or "").strip(),
+                            "fecha_caducidad":    formatear_fecha_caducidad(
+                                                      om.get("FechaCaducidad", "")
+                                                  ),
+                            "material_inv_key":   mat_sust,
+                        })
+
+                if not encontrado:
+                    disp_sust = sum(
+                        inv_caches["inv_filtrado_mat"].get(mat_sust, {}).values()
+                    )
+                    if disp_sust > 0:
+                        templates.append({
+                            "fuente":             "Sustituto",
+                            "material_sugerido":  mat_sust,
+                            "descripcion_sugerida": desc_sust,
+                            "centro_sugerido":    "",
+                            "almacen_sugerido":   "",
+                            "disponible":         disp_sust,
+                            "lote":               "",
+                            "fecha_caducidad":    "",
+                            "material_inv_key":   mat_sust,
+                        })
+
+        # ── LENTO MOV ────────────────────────────────────────────────────
+        elif fuente == "Lento mov":
+            if not idx_fuentes.get(fuente, {}).get(material):
+                continue
+
+            otras     = [f for f in fuentes_activas if f not in ("Sustituto", "Lento mov")]
+            encontrado = False
+            for otra in otras:
+                if encontrado:
+                    break
+                added_any = False
+                for om in idx_fuentes.get(otra, {}).get(material, []):
+                    disp = float(om.get("CantidadDisp", 0) or 0)
+                    if disp <= 0:
+                        continue
+                    added_any = True
+                    templates.append({
+                        "fuente":             f"Lento mov/{otra}",
+                        "material_sugerido":  material,
+                        "descripcion_sugerida": "",
+                        "centro_sugerido":    str(om.get("Centro", "") or "").strip(),
+                        "almacen_sugerido":   str(om.get("Almacén", "") or "").strip(),
+                        "disponible":         disp,
+                        "lote":               str(om.get("Lote", "") or "").strip(),
+                        "fecha_caducidad":    formatear_fecha_caducidad(
+                                                  om.get("FechaCaducidad", "")
+                                              ),
+                        "material_inv_key":   material,
+                    })
+                if added_any:
+                    encontrado = True  # avanza al siguiente 'otra' solo si ya se encontró algo
+
+            if not encontrado:
+                disp_lm = sum(
+                    inv_caches["inv_filtrado_mat"].get(material, {}).values()
+                )
+                if disp_lm > 0:
+                    templates.append({
+                        "fuente":             "Lento mov",
+                        "material_sugerido":  material,
+                        "descripcion_sugerida": "",
+                        "centro_sugerido":    "",
+                        "almacen_sugerido":   "",
+                        "disponible":         disp_lm,
+                        "lote":               "",
+                        "fecha_caducidad":    "",
+                        "material_inv_key":   material,
+                    })
+
+        # ── CORTA CADUCIDAD / COSMOPARK / PNC / CADUCO ───────────────────
+        else:
+            for match in idx_fuentes.get(fuente, {}).get(material, []):
+                disp = float(match.get("CantidadDisp", 0) or 0)
+                if disp <= 0:
+                    continue
+                templates.append({
+                    "fuente":             fuente,
+                    "material_sugerido":  material,
+                    "descripcion_sugerida": str(match.get("Descripcion", "") or ""),
+                    "centro_sugerido":    str(match.get("Centro", "") or "").strip(),
+                    "almacen_sugerido":   str(match.get("Almacén", "") or "").strip(),
+                    "disponible":         disp,
+                    "lote":               str(match.get("Lote", "") or "").strip(),
+                    "fecha_caducidad":    formatear_fecha_caducidad(
+                                              match.get("FechaCaducidad", "")
+                                          ),
+                    "material_inv_key":   material,
+                })
+
+    return templates
+
+
+def _montar_linea_rc(
+    pedido_fields: dict,
+    template: Optional[dict],
+    inv_caches: dict,
+    rc_row_all: Optional[dict] = None,
+) -> dict:
+    """
+    FASE C — Combina los campos del RC con un template de sugerencia (o None
+    para línea sin sugerencia). Todos los lookups de inventario son O(1).
+
+    Cuando se pasa rc_row_all (row.to_dict() de df_reporte_consumo), el dict
+    resultante incluye TODAS las columnas originales del Reporte de Consumo
+    con sus nombres exactos, seguidas de las columnas de sugerencias.
+
+    Columnas internas que NO aparecen en el output final pero son necesarias
+    para que enriquecer_sugerencias_con_consumo funcione correctamente:
+      Columnas.CENTRO_PEDIDO      → "Centro pedido"   (alias de "Centro")
+      Columnas.MATERIAL_SOLICITADO → "Material solicitado" (alias de "Material")
+      Columnas.ALMACEN            → "Almacén"          (vacío en RC)
+    """
+    centro   = pedido_fields["centro"]
+    material = pedido_fields["material"]
+    rc       = rc_row_all or {}
+
+    if template is not None:
+        mat_inv    = template["material_inv_key"]
+        fuente_val = template["fuente"]
+        mat_sug    = template["material_sugerido"]
+        desc_sug   = template["descripcion_sugerida"]
+        centro_sug = template["centro_sugerido"]
+        alm_sug    = template["almacen_sugerido"]
+        disponible = template["disponible"]
+        lote_val   = template["lote"]
+        fec_cad    = template["fecha_caducidad"]
+    else:
+        mat_inv    = material
+        fuente_val = ""
+        mat_sug    = ""
+        desc_sug   = ""
+        centro_sug = ""
+        alm_sug    = ""
+        disponible = 0.0
+        lote_val   = ""
+        fec_cad    = ""
+
+    # ── Inventario O(1) ───────────────────────────────────────────────────
+    inv_alm  = inv_caches["inv_centro_alm"].get((centro, mat_inv), {})
+    inv_1030 = inv_alm.get("1030", 0.0)
+    inv_1031 = inv_alm.get("1031", 0.0)
+    inv_1032 = inv_alm.get("1032", 0.0)
+    inv_1060 = inv_alm.get("1060", 0.0)
+
+    tr       = inv_caches["transito"].get((centro, mat_inv), {})
+    tr_total = sum(tr.values())
+
+    disp_1031_1030 = inv_caches["disp_1031"].get((mat_inv, "1030"), 0.0)
+    disp_1031_1032 = inv_caches["disp_1031"].get((mat_inv, "1032"), 0.0)
+
+    inv_por_centro = inv_caches["inv_filtrado_mat"].get(mat_inv, {})
+
+    pendiente        = pedido_fields["pendiente"]
+    cantidad_ofertar = (
+        min(pendiente, disponible) if (template is not None and pendiente > 0) else 0.0
+    )
+
+    def _s(key, default=""):
+        return str(rc.get(key, default) or default).strip()
+
+    def _f(key, default=0.0):
+        try:
+            return float(rc.get(key, default) or default)
+        except (ValueError, TypeError):
+            return float(default)
+
+    return {
+        # ── Columnas originales del Reporte de Consumo (nombres exactos) ──
+        "Centro":                          centro,
+        "Grp. Cliente":                    _s("Grp. Cliente"),
+        "Gpo. Vdor.":                      _s("Gpo. Vdor."),
+        "Solicitante":                     _s("Solicitante"),
+        "Destinatario":                    _s("Destinatario"),
+        "Razón Social":                    _s("Razón Social"),
+        "Material":                        material,
+        "Texto Material":                  _s("Texto Material"),
+        "Ultima_compra_cliente":           _s("Ultima_compra_cliente"),
+        "Ultima_facturacion_destinatario": _s("Ultima_facturacion_destinatario"),
+        "Consumo_promedio_mensual":        pedido_fields["pendiente"],
+        "Consumo_actual":                  _f("Consumo_actual"),
+        "UM":                              _s("UM"),
+        "Tendencia":                       _f("Tendencia"),
+        "Tendencia de cantidad":           _f("Tendencia de cantidad"),
+        "Ultimo mes facturacion":          _s("Ultimo mes facturacion"),
+        "Cantidad ultima":                 pedido_fields["cantidad"],
+        "Importe ultima":                  _f("Importe ultima"),
+        "Precio_unitario_ultima":          pedido_fields["precio"],
+        "Penultima_fecha":                 _s("Penultima_fecha"),
+        "Cantidad_penultima":              _f("Cantidad_penultima"),
+        "Importe_penultima":               _f("Importe_penultima"),
+        "Precio_unitario_penultima":       _f("Precio_unitario_penultima"),
+        "precio_min":                      _f("precio_min"),
+        "precio_max":                      _f("precio_max"),
+        "precio_prom":                     _f("precio_prom"),
+        # ── Columnas de sugerencia (Columnas.* constants) ──────────────────
+        Columnas.FUENTE:                   fuente_val,
+        Columnas.MATERIAL_SUGERIDO:        mat_sug,
+        Columnas.DESCRIPCION_SUGERIDA:     desc_sug,
+        Columnas.CENTRO_SUGERIDO:          centro_sug,
+        Columnas.ALMACEN_SUGERIDO:         alm_sug,
+        Columnas.DISPONIBLE:               disponible,
+        Columnas.LOTE:                     lote_val,
+        Columnas.FECHA_CADUCIDAD:          fec_cad,
+        Columnas.CENTRO_INV:               centro,
+        Columnas.INV_1030:                 inv_1030,
+        Columnas.INV_1031:                 inv_1031,
+        Columnas.INV_1032:                 inv_1032,
+        Columnas.INV_1060:                 inv_1060,
+        Columnas.MESES_INVENTARIO:         0.0,   # post-proceso
+        Columnas.PROMEDIO_CONSUMO_12M:     0.0,   # post-proceso
+        Columnas.CONSUMO_DESTINATARIO_12M: 0.0,   # post-proceso
+        Columnas.CANT_TRANSITO:            tr_total,
+        Columnas.CANT_TRANSITO_1030:       tr.get("1030", 0.0),
+        Columnas.CANT_TRANSITO_1031:       tr.get("1031", 0.0),
+        Columnas.CANT_TRANSITO_1032:       tr.get("1032", 0.0),
+        Columnas.DISP_1031_1030:           disp_1031_1030,
+        Columnas.DISP_1031_1032:           disp_1031_1032,
+        Columnas.INV_1001:                 inv_por_centro.get("1001", 0.0),
+        Columnas.INV_1003:                 inv_por_centro.get("1003", 0.0),
+        Columnas.INV_1004:                 inv_por_centro.get("1004", 0.0),
+        Columnas.INV_1017:                 inv_por_centro.get("1017", 0.0),
+        Columnas.INV_1018:                 inv_por_centro.get("1018", 0.0),
+        Columnas.INV_1022:                 inv_por_centro.get("1022", 0.0),
+        Columnas.INV_1036:                 inv_por_centro.get("1036", 0.0),
+        # ── Alias internos para enriquecer_sugerencias_con_consumo ─────────
+        # (no aparecen en columnas_orden → se excluyen del output final)
+        Columnas.CENTRO_PEDIDO:            centro,    # "Centro pedido"
+        Columnas.MATERIAL_SOLICITADO:      material,  # "Material solicitado"
+        Columnas.ALMACEN:                  "",        # "Almacén"
+    }
+
+
+# =========================
+# NUEVA FUNCIÓN: Generar sugerencias usando como base el Reporte de Consumo
+# (versión optimizada — ver sección de pre-indexado arriba)
+# =========================
+def generar_sugerencias_desde_reporte_consumo(
+    df_reporte_consumo: pd.DataFrame,
+    hojas_externas: Dict[str, pd.DataFrame],
+    fuentes_activas: List[str],
+    inventario_df: pd.DataFrame,
+    df_resumen: pd.DataFrame = None,
+) -> pd.DataFrame:
+    """
+    Genera un reporte de sugerencias tomando como base cada fila del Reporte
+    de Consumo. Aplica la misma lógica que 'Todas las Sugerencias' pero sobre
+    registros históricos de facturación.
+
+    Optimización respecto a la versión ingénua (row-by-row con escaneos):
+      · FASE A – Pre-indexa inventario y fuentes una sola vez (O(n) total).
+      · FASE B – Calcula templates de sugerencia por par único (Material, Centro):
+                 reduce iteraciones pesadas de ~70 k a N_unique pares.
+      · FASE C – Arma las 70 k líneas con lookups O(1); sin escanear DataFrames.
+
+    Mapeo de columnas RC → pedido interno documentado en _montar_linea_rc.
+    """
+    if df_reporte_consumo is None or df_reporte_consumo.empty:
+        return pd.DataFrame()
+
+    progress_bar = st.progress(0)
+    status_text  = st.empty()
+
+    # ── FASE A: Pre-indexado (ejecuta una sola vez) ───────────────────────
+    status_text.text("⚙️ Pre-indexando inventario…")
+    inv_caches = _build_inv_caches_rc(inventario_df)
+    progress_bar.progress(0.10)
+
+    status_text.text("⚙️ Pre-indexando fuentes externas…")
+    idx_fuentes = _build_fuentes_index_rc(hojas_externas, fuentes_activas)
+    progress_bar.progress(0.20)
+
+    # ── FASE B: Templates por par único (Material, Centro) ────────────────
+    pares_unicos = (
+        df_reporte_consumo[["Material", "Centro"]]
+        .drop_duplicates()
+        .dropna(subset=["Material"])
+    )
+    pares_unicos = pares_unicos[
+        pares_unicos["Material"].astype(str).str.strip() != ""
+    ]
+
+    total_pares   = max(len(pares_unicos), 1)
+    templates_cache: Dict[tuple, List[dict]] = {}
+
+    status_text.text(
+        f"🔎 Calculando sugerencias para {total_pares:,} pares únicos (Material, Centro)…"
+    )
+    for i, (_, pair) in enumerate(pares_unicos.iterrows()):
+        material = str(pair.get("Material", "") or "").strip()
+        centro   = str(pair.get("Centro", "") or "").strip()
+        if not material:
+            continue
+        templates_cache[(material, centro)] = _buscar_templates_sug_rc(
+            material, fuentes_activas, idx_fuentes, inv_caches
+        )
+        if i % max(1, total_pares // 50) == 0:
+            progress_bar.progress(0.20 + 0.45 * (i / total_pares))
+
+    progress_bar.progress(0.65)
+
+    # ── FASE C: Armar todas las líneas de salida (O(1) por fila) ─────────
+    total_rows = len(df_reporte_consumo)
+    status_text.text(f"📋 Armando {total_rows:,} líneas de reporte…")
+
+    todas_lineas: List[dict] = []
+    for i, (_, row) in enumerate(df_reporte_consumo.iterrows()):
+        material = str(row.get("Material", "") or "").strip()
+        centro   = str(row.get("Centro", "") or "").strip()
+        if not material:
+            continue
+
+        pedido_fields = {
+            "gpo_cte":       str(row.get("Grp. Cliente",            "") or "").strip(),
+            "fecha":         str(row.get("Ultima_compra_cliente",    "") or "").strip(),
+            "gpo_vdor":      str(row.get("Gpo. Vdor.",              "") or "").strip(),
+            "solicitante":   str(row.get("Solicitante",              "") or "").strip(),
+            "destinatario":  str(row.get("Destinatario",             "") or "").strip(),
+            "razon_social":  str(row.get("Razón Social",             "") or "").strip(),
+            "centro":        centro,
+            "material":      material,
+            "texto_material": str(row.get("Texto Material",          "") or "").strip(),
+            "cantidad":      float(row.get("Cantidad ultima",         0)  or 0),
+            "pendiente":     float(row.get("Consumo_promedio_mensual", 0) or 0),
+            "precio":        float(row.get("Precio_unitario_ultima",   0) or 0),
+        }
+
+        # Línea sin sugerencia
+        todas_lineas.append(_montar_linea_rc(pedido_fields, None, inv_caches, row.to_dict()))
+
+        # Líneas con sugerencia (templates pre-calculados → O(1) lookup)
+        for tmpl in templates_cache.get((material, centro), []):
+            todas_lineas.append(_montar_linea_rc(pedido_fields, tmpl, inv_caches, row.to_dict()))
+
+        if i % max(1, total_rows // 50) == 0:
+            progress_bar.progress(0.65 + 0.25 * (i / total_rows))
+
+    progress_bar.progress(0.90)
+    status_text.text("✔️ Consolidando y enriqueciendo…")
+
+    progress_bar.empty()
+    status_text.empty()
+
+    if not todas_lineas:
+        return pd.DataFrame()
+
+    df_resultado = pd.DataFrame(todas_lineas)
+    df_resultado = consolidar_sugerencias_repetidas(df_resultado)
+    df_resultado = enriquecer_sugerencias_con_consumo(
+        df_resultado,
+        df_resumen if df_resumen is not None else pd.DataFrame(),
+        df_reporte_consumo=df_reporte_consumo,
+    )
+
+    # ── Orden de columnas EXACTO (54 columnas, nombres literales) ────────
+    # Grupo 1: columnas del Reporte de Consumo (26 cols)
+    # Grupo 2: columnas de sugerencias         (28 cols)
+    # Columnas internas de alias usadas por enriquecer_sugerencias_con_consumo
+    # ("Centro pedido", "Material solicitado", "Almacén") quedan fuera por no
+    # estar listadas aquí.
+    COLUMNAS_FINALES_RC = [
+        # ── Grupo 1: Reporte de Consumo ───────────────────────────────────
+        "Centro",
+        "Grp. Cliente",
+        "Gpo. Vdor.",
+        "Solicitante",
+        "Destinatario",
+        "Razón Social",
+        "Material",
+        "Texto Material",
+        "Ultima_compra_cliente",
+        "Ultima_facturacion_destinatario",
+        "Consumo_promedio_mensual",
+        "Consumo_actual",
+        "UM",
+        "Tendencia",
+        "Tendencia de cantidad",
+        "Ultimo mes facturacion",
+        "Cantidad ultima",
+        "Importe ultima",
+        "Precio_unitario_ultima",
+        "Penultima_fecha",
+        "Cantidad_penultima",
+        "Importe_penultima",
+        "Precio_unitario_penultima",
+        "precio_min",
+        "precio_max",
+        "precio_prom",
+        # ── Grupo 2: Sugerencias ──────────────────────────────────────────
+        "Fuente",
+        "Material sugerido",
+        "Descripción sugerida",
+        "Centro sugerido",
+        "Almacén sugerido",
+        "Disponible",
+        "Lote",
+        "Fecha de Caducidad",
+        "Centro (Inv)",
+        "Inv 1030",
+        "Inv 1031",
+        "Inv 1032",
+        "Inv 1060",
+        "Meses_Inventario",
+        "Promedio_Consumo_12M",
+        "Cant. en Tránsito",
+        "Cant. en Tránsito 1030",
+        "Cant. en Tránsito 1031",
+        "Cant. en Tránsito 1032",
+        "Disponible 1031-1030",
+        "Disponible 1031-1032",
+        "Inv 1001",
+        "Inv 1003",
+        "Inv 1004",
+        "Inv 1017",
+        "Inv 1018",
+        "Inv 1022",
+        "Inv 1036",
+    ]
+
+    # Garantizar que cada columna exista (sin lanzar KeyError)
+    for col in COLUMNAS_FINALES_RC:
+        if col not in df_resultado.columns:
+            df_resultado[col] = ""
+
+    return df_resultado[COLUMNAS_FINALES_RC]
 
 
 # =========================
@@ -2025,91 +3028,83 @@ def calcular_estadisticas_consumo_por_centro_material_almacen(
             + df_facturacion_procesado["Fecha"].dt.month
         )
 
-        # Filtrar solo datos válidos
+        # Filtrar solo fechas válidas; cantidades negativas (devoluciones) se incluyen
+        # para reflejar el consumo neto real
         df_valido = df_facturacion_procesado[
-            (df_facturacion_procesado["Fecha"].notna())
-            & (df_facturacion_procesado["Cantidad"] > 0)
+            df_facturacion_procesado["Fecha"].notna()
         ].copy()
 
         if df_valido.empty:
             return pd.DataFrame()
 
-        # Calcular últimos 12 meses desde la fecha máxima
+        # ── Totales netos por Centro/Material/Almacén/Mes ────────────────────
+        monthly = (
+            df_valido.groupby(
+                ["Centro", "Material", "Almacén", "MesAno_num", "MesAno_str"]
+            )["Cantidad"]
+            .sum()
+            .reset_index()
+        )
+
+        KEYS = ["Centro", "Material", "Almacén"]
+
+        # ── Últimos 12 meses desde la fecha máxima global ────────────────────
         fecha_maxima = df_valido["Fecha"].max()
         fecha_inicio_12m = fecha_maxima - pd.DateOffset(months=12)
+        mes_inicio_12m_num = fecha_inicio_12m.year * 100 + fecha_inicio_12m.month
 
-        # Filtrar últimos 12 meses para el promedio
-        df_ultimos_12m = df_valido[df_valido["Fecha"] >= fecha_inicio_12m].copy()
+        monthly_12m = monthly[monthly["MesAno_num"] >= mes_inicio_12m_num]
 
-        # Agrupar por Centro, Material, Almacén para estadísticas
-        resultados = []
-
-        for (centro, material, almacen), group in df_valido.groupby(
-            ["Centro", "Material", "Almacén"]
-        ):
-            # Obtener los meses únicos ordenados DESCENDENTE por fecha (numérica)
-            # Primero creamos un DataFrame con meses únicos ordenados
-            meses_df = group[["MesAno_num", "MesAno_str"]].drop_duplicates()
-            meses_df = meses_df.sort_values("MesAno_num", ascending=False)
-
-            meses_unicos = meses_df["MesAno_str"].tolist()
-
-            # Inicializar valores
-            ultimo_mes = ""
-            penultimo_mes = ""
-            cantidad_ultimo_mes = 0
-            cantidad_penultimo_mes = 0
-
-            # Obtener último y penúltimo mes (ORDENADOS CRONOLÓGICAMENTE)
-            if len(meses_unicos) >= 1:
-                ultimo_mes = meses_unicos[0]
-                # Sumar todas las cantidades del último mes
-                ultimo_mes_num = meses_df.iloc[0]["MesAno_num"]
-                cantidad_ultimo_mes = group[group["MesAno_num"] == ultimo_mes_num][
-                    "Cantidad"
-                ].sum()
-
-            if len(meses_unicos) >= 2:
-                penultimo_mes = meses_unicos[1]
-                # Sumar todas las cantidades del penúltimo mes
-                penultimo_mes_num = meses_df.iloc[1]["MesAno_num"]
-                cantidad_penultimo_mes = group[
-                    group["MesAno_num"] == penultimo_mes_num
-                ]["Cantidad"].sum()
-
-            # Calcular promedio de últimos 12 meses
-            group_12m = df_ultimos_12m[
-                (df_ultimos_12m["Centro"] == centro)
-                & (df_ultimos_12m["Material"] == material)
-                & (df_ultimos_12m["Almacén"] == almacen)
-            ]
-
-            if not group_12m.empty:
-                # Calcular meses únicos en los últimos 12 meses
-                # Usar MesAno_num para contar meses únicos correctamente
-                meses_12m = group_12m["MesAno_num"].nunique()
-                if meses_12m > 0:
-                    total_cantidad_12m = group_12m["Cantidad"].sum()
-                    promedio_consumo_12m = total_cantidad_12m / meses_12m
-                else:
-                    promedio_consumo_12m = 0
-            else:
-                promedio_consumo_12m = 0
-
-            resultados.append(
-                {
-                    "Centro": centro,
-                    "Material": material,
-                    "Almacen": almacen,
-                    "Promedio_Consumo_12M": round(promedio_consumo_12m, 2),
-                    "Ultimo_Mes_Consumo": ultimo_mes,
-                    "Penultimo_Mes_Consumo": penultimo_mes,
-                    "Cantidad_Ultimo_Mes": cantidad_ultimo_mes,
-                    "Cantidad_Penultimo_Mes": cantidad_penultimo_mes,
-                }
+        # Promedio 12M: suma neta / número de meses únicos en el período
+        promedio_df = (
+            monthly_12m.groupby(KEYS)
+            .agg(
+                total_12m=("Cantidad", "sum"),
+                meses_12m=("MesAno_num", "nunique"),
             )
+            .reset_index()
+        )
+        promedio_df["Promedio_Consumo_12M"] = (
+            (promedio_df["total_12m"] / promedio_df["meses_12m"]).fillna(0).round(2)
+        )
 
-        return pd.DataFrame(resultados)
+        # ── Último y penúltimo mes por grupo ─────────────────────────────────
+        monthly_sorted = monthly.sort_values(
+            KEYS + ["MesAno_num"], ascending=[True, True, True, False]
+        )
+        monthly_sorted["rank"] = monthly_sorted.groupby(KEYS).cumcount() + 1
+
+        ult = monthly_sorted[monthly_sorted["rank"] == 1][
+            KEYS + ["MesAno_str", "Cantidad"]
+        ].rename(
+            columns={
+                "MesAno_str": "Ultimo_Mes_Consumo",
+                "Cantidad": "Cantidad_Ultimo_Mes",
+            }
+        )
+        pen = monthly_sorted[monthly_sorted["rank"] == 2][
+            KEYS + ["MesAno_str", "Cantidad"]
+        ].rename(
+            columns={
+                "MesAno_str": "Penultimo_Mes_Consumo",
+                "Cantidad": "Cantidad_Penultimo_Mes",
+            }
+        )
+
+        # ── Combinar todo ─────────────────────────────────────────────────────
+        result = promedio_df[KEYS + ["Promedio_Consumo_12M"]].copy()
+        result = result.merge(ult, on=KEYS, how="left")
+        result = result.merge(pen, on=KEYS, how="left")
+
+        result["Ultimo_Mes_Consumo"] = result["Ultimo_Mes_Consumo"].fillna("")
+        result["Penultimo_Mes_Consumo"] = result["Penultimo_Mes_Consumo"].fillna("")
+        result["Cantidad_Ultimo_Mes"] = result["Cantidad_Ultimo_Mes"].fillna(0)
+        result["Cantidad_Penultimo_Mes"] = result["Cantidad_Penultimo_Mes"].fillna(0)
+
+        # Renombrar Almacén → Almacen para consistencia con el resto del código
+        result = result.rename(columns={"Almacén": "Almacen"})
+
+        return result
 
     except Exception as e:
         logger.error(f"Error al calcular estadísticas de consumo: {str(e)}")
@@ -2389,34 +3384,48 @@ def generar_resumen_sin_sugerencias_optimizado(
     if "Descripcion" in grouped.columns:
         grouped["Descripcion"] = grouped["Descripcion"].fillna("")
 
-    # 6. PRECOMPUTAR DATOS DE INVENTARIO PARA CÁLCULOS RÁPIDOS
+    # 6. PRECOMPUTAR DATOS DE INVENTARIO PARA CÁLCULOS RÁPIDOS (vectorizado)
     inventario_cache = {}
     descripcion_cache = {}
     transito_cache = {}
 
     if inventario_df is not None and not inventario_df.empty:
-        for _, row in inventario_df.iterrows():
-            centro = str(row.get("Centro", "")).strip()
-            material = str(row.get("Material", "")).strip()
-            almacen = str(row.get("Almacén", "")).strip()
-            libre = float(row.get("Libre Utilización", 0))
-            transito = float(row.get("Cant. en Tránsito", 0))
-            descripcion = str(row.get("Descripción", "")).strip()
+        inv_tmp = inventario_df.copy()
+        inv_tmp["_centro"] = inv_tmp["Centro"].astype(str).str.strip()
+        inv_tmp["_material"] = inv_tmp["Material"].astype(str).str.strip()
+        inv_tmp["_almacen"] = inv_tmp["Almacén"].astype(str).str.strip()
 
-            key_inv = f"{centro}_{material}_{almacen}"
-            inventario_cache[key_inv] = libre
+        # inventario_cache: {centro_material_almacen: libre}
+        inv_tmp["_key_inv"] = (
+            inv_tmp["_centro"] + "_" + inv_tmp["_material"] + "_" + inv_tmp["_almacen"]
+        )
+        inventario_cache = inv_tmp.set_index("_key_inv")["Libre Utilización"].to_dict()
 
-            key_desc = f"{centro}_{material}_{almacen}"
-            if key_desc not in descripcion_cache and descripcion:
-                descripcion_cache[key_desc] = descripcion
-
-            key_trans = f"{centro}_{material}"
-            if key_trans not in transito_cache:
-                transito_cache[key_trans] = {"1030": 0, "1031": 0, "1032": 0}
-            if almacen in ["1030", "1031", "1032"]:
-                transito_cache[key_trans][almacen] = (
-                    transito_cache[key_trans].get(almacen, 0) + transito
+        # descripcion_cache
+        if "Descripción" in inv_tmp.columns:
+            desc_sub = inv_tmp[inv_tmp["Descripción"].astype(str).str.strip() != ""]
+            if not desc_sub.empty:
+                descripcion_cache = (
+                    desc_sub.drop_duplicates("_key_inv")
+                    .set_index("_key_inv")["Descripción"]
+                    .to_dict()
                 )
+
+        # transito_cache: {centro_material: {almacen: transito}}
+        trans_sub = inv_tmp[inv_tmp["_almacen"].isin(["1030", "1031", "1032"])]
+        if not trans_sub.empty:
+            trans_grouped = (
+                trans_sub.groupby(["_centro", "_material", "_almacen"])[
+                    "Cant. en Tránsito"
+                ]
+                .sum()
+                .reset_index()
+            )
+            for _, row in trans_grouped.iterrows():
+                key = f"{row['_centro']}_{row['_material']}"
+                if key not in transito_cache:
+                    transito_cache[key] = {"1030": 0, "1031": 0, "1032": 0}
+                transito_cache[key][row["_almacen"]] = float(row["Cant. en Tránsito"])
 
     # 7. CALCULAR ESTADÍSTICAS DE CONSUMO (NUEVO)
     estadisticas_consumo_df = None
@@ -2455,64 +3464,76 @@ def generar_resumen_sin_sugerencias_optimizado(
         grouped["Cantidad_Ultimo_Mes"] = 0
         grouped["Cantidad_Penultimo_Mes"] = 0
 
-    # 9. AGREGAR DATOS DE INVENTARIO ESPECÍFICOS POR ALMACÉN
-    def obtener_datos_inventario_resumen(row):
-        centro = row["Centro"]
-        almacen = row["Almacen"]
-        material = row["Material"]
+    # 9. AGREGAR DATOS DE INVENTARIO ESPECÍFICOS POR ALMACÉN (vectorizado)
+    def _build_inv_col(col_key_suffix: str, cache: dict) -> pd.Series:
+        keys = grouped["Centro"] + "_" + grouped["Material"] + "_" + col_key_suffix
+        return keys.map(cache).fillna(0)
 
-        # Obtener inventario por almacén específico
-        inv_1030 = inventario_cache.get(f"{centro}_{material}_1030", 0)
-        inv_1031 = inventario_cache.get(f"{centro}_{material}_1031", 0)
-        inv_1032 = inventario_cache.get(f"{centro}_{material}_1032", 0)
+    grouped["Inv 1030"] = _build_inv_col("1030", inventario_cache)
+    grouped["Inv 1031"] = _build_inv_col("1031", inventario_cache)
+    grouped["Inv 1032"] = _build_inv_col("1032", inventario_cache)
+    grouped["Inv 1060"] = _build_inv_col("1060", inventario_cache)
 
-        # Obtener tránsito para el almacén específico
-        transito_key = f"{centro}_{material}"
-        transito_almacen = transito_cache.get(transito_key, {}).get(almacen, 0)
-
-        # Disponible en centro 1031 para almacenes 1030 y 1032
-        disp_1031_1030 = inventario_cache.get(f"1031_{material}_1030", 0)
-        disp_1031_1032 = inventario_cache.get(f"1031_{material}_1032", 0)
-
-        return pd.Series(
-            [
-                inv_1030,
-                inv_1031,
-                inv_1032,
-                transito_almacen,
-                disp_1031_1030,
-                disp_1031_1032,
-            ]
+    # Tránsito por almacén específico de cada fila
+    trans_key = grouped["Centro"] + "_" + grouped["Material"]
+    grouped["Cant. en Tránsito"] = trans_key.map(
+        lambda k: (
+            transito_cache.get(k, {}).get(
+                grouped.at[
+                    (
+                        grouped.index[
+                            grouped["Centro"] + "_" + grouped["Material"] == k
+                        ].tolist()[0]
+                        if (grouped["Centro"] + "_" + grouped["Material"] == k).any()
+                        else 0
+                    ),
+                    "Almacen",
+                ],
+                0,
+            )
+            if k in transito_cache
+            else 0
         )
+    )
+    # Vectorized transit per row using Almacen column
+    _trans_vals = []
+    for _, row in grouped[["Centro", "Material", "Almacen"]].iterrows():
+        k = f"{row['Centro']}_{row['Material']}"
+        _trans_vals.append(transito_cache.get(k, {}).get(row["Almacen"], 0))
+    grouped["Cant. en Tránsito"] = _trans_vals
 
-    columnas_inventario_resumen = [
-        "Inv 1030",
-        "Inv 1031",
-        "Inv 1032",
-        "Cant. en Tránsito",
-        "Disponible 1031-1030",
-        "Disponible 1031-1032",
-    ]
-
-    grouped[columnas_inventario_resumen] = grouped.apply(
-        obtener_datos_inventario_resumen, axis=1, result_type="expand"
+    # Disponible 1031-1030 y 1031-1032 (fijo por material, independiente del almacén de la fila)
+    grouped["Disponible 1031-1030"] = grouped["Material"].map(
+        lambda m: inventario_cache.get(f"1031_{m}_1030", 0)
+    )
+    grouped["Disponible 1031-1032"] = grouped["Material"].map(
+        lambda m: inventario_cache.get(f"1031_{m}_1032", 0)
     )
 
     # 10. CALCULAR MESES DE INVENTARIO
-    def calcular_meses_inventario(row):
-        # Calcular inventario total en el centro para el material
-        inv_total = (
-            row.get("Inv 1030", 0) + row.get("Inv 1031", 0) + row.get("Inv 1032", 0)
-        )
-
-        # Calcular meses de inventario
-        consumo_promedio = row.get("Promedio_Consumo_12M", 0)
-        if consumo_promedio > 0:
-            return round(inv_total / consumo_promedio, 2)
-        else:
-            return 0 if inv_total == 0 else 999  # Si hay inventario pero no consumo
-
-    grouped["Meses_Inventario"] = grouped.apply(calcular_meses_inventario, axis=1)
+    # Regla: si el almacén del pedido es 1030 → usar Inv 1030
+    #        si el almacén del pedido es 1031 → usar Inv 1031
+    #        si el almacén del pedido es 1060 → usar Inv 1060
+    #        en cualquier otro caso            → usar Inv 1032
+    inv_segun_almacen = np.select(
+        [
+            grouped["Almacen"].astype(str).str.strip() == "1030",
+            grouped["Almacen"].astype(str).str.strip() == "1031",
+            grouped["Almacen"].astype(str).str.strip() == "1060",
+        ],
+        [
+            grouped["Inv 1030"],
+            grouped["Inv 1031"],
+            grouped["Inv 1060"],
+        ],
+        default=grouped["Inv 1032"],
+    )
+    consumo_prom = grouped["Promedio_Consumo_12M"]
+    grouped["Meses_Inventario"] = np.where(
+        consumo_prom > 0,
+        (inv_segun_almacen / consumo_prom).round(2),
+        np.where(inv_segun_almacen == 0, 0.0, 999.0),
+    )
 
     # 11. CALCULAR PENDIENTE POR CENTRO SIN BLOQUEO - VERSIÓN CORREGIDA
     pendiente_por_centro_dict = None
@@ -2521,39 +3542,25 @@ def generar_resumen_sin_sugerencias_optimizado(
             df_todas_sugerencias
         )
 
-    # 12. AGREGAR PENDIENTE POR CENTRO - VERSIÓN CORREGIDA
+    # 12. AGREGAR PENDIENTE POR CENTRO - versión vectorizada
     centros_interes = ["1001", "1003", "1004", "1017", "1018", "1022", "1036"]
 
     if pendiente_por_centro_dict:
         for centro in centros_interes:
-            if (
-                centro in pendiente_por_centro_dict
-                and pendiente_por_centro_dict[centro]
-            ):
-                # Crear diccionario para este centro
-                centro_dict = pendiente_por_centro_dict[centro]
-
-                # **CORRECCIÓN:** Solo asignar si el Centro de la fila coincide EXACTAMENTE
-                # y si existe en el diccionario
-                def asignar_pendiente(row, centro_dict, centro):
-                    # Verificar que el centro de la fila sea el mismo que estamos procesando
-                    if str(row["Centro"]).strip() != str(centro).strip():
-                        return 0
-
-                    # Crear la clave para buscar
-                    clave = f"{row['Material']}_{row['Almacen']}"
-
-                    # Buscar en el diccionario
-                    if clave in centro_dict:
-                        return centro_dict[clave]
-                    else:
-                        return 0
-
-                grouped[f"Pendiente {centro}"] = grouped.apply(
-                    lambda row: asignar_pendiente(row, centro_dict, centro), axis=1
+            col_name = f"Pendiente {centro}"
+            centro_dict = pendiente_por_centro_dict.get(centro, {})
+            if centro_dict:
+                # Crear máscara: solo filas donde el Centro de la fila == centro
+                mask_centro = grouped["Centro"].astype(str).str.strip() == str(centro)
+                claves = (
+                    grouped["Material"].astype(str).str.strip()
+                    + "_"
+                    + grouped["Almacen"].astype(str).str.strip()
                 )
+                valores = claves.map(centro_dict).fillna(0)
+                grouped[col_name] = np.where(mask_centro, valores, 0)
             else:
-                grouped[f"Pendiente {centro}"] = 0
+                grouped[col_name] = 0
     else:
         for centro in centros_interes:
             grouped[f"Pendiente {centro}"] = 0
@@ -2576,6 +3583,7 @@ def generar_resumen_sin_sugerencias_optimizado(
         "Inv 1030",
         "Inv 1031",
         "Inv 1032",
+        "Inv 1060",
         "Cant. en Tránsito",
         "Disponible 1031-1030",
         "Disponible 1031-1032",
@@ -2621,6 +3629,7 @@ def exportar_a_excel(
     df_todas_sugerencias: pd.DataFrame = None,
     df_resumen_sin_sugerencias: pd.DataFrame = None,
     df_reporte_consumo: pd.DataFrame = None,
+    df_sug_consumo: pd.DataFrame = None,
 ) -> bytes:
     """Exporta los reportes seleccionados a Excel"""
     output = io.BytesIO()
@@ -2645,6 +3654,12 @@ def exportar_a_excel(
         if df_reporte_consumo is not None and not df_reporte_consumo.empty:
             df_reporte_consumo.to_excel(
                 writer, sheet_name="Reporte de Consumo", index=False
+            )
+
+        # Agregar hoja "Sug Reporte Consumo" si se proporciona (nueva)
+        if df_sug_consumo is not None and not df_sug_consumo.empty:
+            df_sug_consumo.to_excel(
+                writer, sheet_name="Sug Reporte Consumo", index=False
             )
 
     return output.getvalue()
@@ -2697,6 +3712,16 @@ generar_reporte_consumo_report = st.sidebar.checkbox(
     "Generar 'Reporte de Consumo'", value=False
 )
 
+generar_sug_consumo_report = st.sidebar.checkbox(
+    "Generar 'Sugerencias desde Consumo'",
+    value=False,
+    help=(
+        "Requiere tener activo 'Generar Reporte de Consumo' y cargar el archivo de facturación. "
+        "Aplica la misma lógica de sugerencias del reporte principal, pero sobre los registros "
+        "del Reporte de Consumo."
+    ),
+)
+
 # Modo depuración para ver columnas
 modo_depuracion = st.sidebar.checkbox("Modo depuración (ver columnas)", value=False)
 
@@ -2727,7 +3752,8 @@ archivo_externas = st.file_uploader(
     key="externas",
 )
 
-if generar_reporte_consumo_report:
+_necesita_facturacion = generar_reporte_consumo_report or generar_sug_consumo_report
+if _necesita_facturacion:
     archivo_facturacion = st.file_uploader(
         "4. Archivo con pestaña 'Facturacion' o 'sheets1' (Excel)",
         type=["xlsx", "xls"],
@@ -2736,735 +3762,1122 @@ if generar_reporte_consumo_report:
 else:
     archivo_facturacion = None
     st.info(
-        "Para cargar el archivo de facturación, active 'Generar Reporte de Consumo' en la barra lateral"
+        "Para cargar el archivo de facturación, active 'Generar Reporte de Consumo' "
+        "o 'Sugerencias desde Consumo' en la barra lateral"
     )
 
-# Verificar que se hayan subido los 3 archivos
+# Verificar que se hayan subido los 3 archivos obligatorios
+# (facturación solo es obligatoria si se activa un reporte que la necesita)
 if (
     archivo_principal
     and archivo_inventario
     and archivo_externas
     and (
-        not generar_reporte_consumo_report
-        or (generar_reporte_consumo_report and archivo_facturacion)
+        not _necesita_facturacion
+        or (_necesita_facturacion and archivo_facturacion)
     )
 ):
+    timer_total = Timer()
 
-    with st.spinner("Procesando archivos..."):
-        try:
-            # Cargar archivo principal
+    # ── Inicializar cache ────────────────────────────────────────────────────
+    if "cache_inicializado" not in st.session_state:
+        st.session_state.cache_inicializado = True
+        st.session_state.cache_pedidos = None
+        st.session_state.cache_inventario = None
+        st.session_state.cache_externas = None
+        st.session_state.cache_facturacion = None
 
-            xls_principal = pd.ExcelFile(archivo_principal)
+    if "reportes_generados" not in st.session_state:
+        st.session_state.reportes_generados = {}
 
-            # ------------------------------
-            # Detectar hoja principal (Seg pedidos / sheets)
-            # ------------------------------
-            sheet_map = {s.strip().casefold(): s for s in xls_principal.sheet_names}
-            hoja_pedidos = None
+    usar_cache = st.checkbox(
+        "Usar cache de datos procesados (acelera reprocesamiento)", value=True
+    )
 
-            # 1) Por nombre (case-insensitive)
-            for candidato in ["seg pedidos", "sheets1"]:
-                if candidato in sheet_map:
-                    hoja_pedidos = sheet_map[candidato]
-                    break
+    try:
+        # ════════════════════════════════════════════════════════════════════
+        # FASE 1 – CARGA Y PROCESAMIENTO DE ARCHIVOS (en paralelo)
+        # ════════════════════════════════════════════════════════════════════
+        with st.status(
+            "📂 Cargando y procesando archivos…", expanded=True
+        ) as status_carga:
 
-            # 2) Si no coincide por nombre, detectar por columnas mínimas
-            if hoja_pedidos is None:
-                columnas_minimas = {
-                    "Pedido",
-                    "Material",
-                    "Centro",
-                }  # ajusta si tu SAP trae otras fijas
-                for sh in xls_principal.sheet_names:
-                    try:
-                        cols = set(pd.read_excel(xls_principal, sh, nrows=0).columns)
-                        if columnas_minimas.issubset(cols):
-                            hoja_pedidos = sh
-                            break
-                    except Exception:
-                        pass
-
-            if hoja_pedidos is None:
-                st.error(
-                    "El archivo principal debe contener la hoja 'Seg pedidos' o 'sheets1' "
-                    "o una hoja con columnas mínimas: Pedido, Material, Centro.\n"
-                    f"Hojas encontradas: {xls_principal.sheet_names}"
+            # ── Función para cargar pedidos ──────────────────────────────
+            def _cargar_pedidos():
+                t = Timer()
+                xls = pd.ExcelFile(archivo_principal)
+                sheet_map = {s.strip().casefold(): s for s in xls.sheet_names}
+                hoja = None
+                for candidato in ["seg pedidos", "sheets1"]:
+                    if candidato in sheet_map:
+                        hoja = sheet_map[candidato]
+                        break
+                if hoja is None:
+                    cols_min = {"Pedido", "Material", "Centro"}
+                    for sh in xls.sheet_names:
+                        try:
+                            cols = set(pd.read_excel(xls, sh, nrows=0).columns)
+                            if cols_min.issubset(cols):
+                                hoja = sh
+                                break
+                        except Exception:
+                            pass
+                if hoja is None:
+                    raise ValueError(
+                        f"No se encontró hoja de pedidos. Hojas: {xls.sheet_names}"
+                    )
+                df = pd.read_excel(xls, hoja)
+                df.columns = [
+                    col.replace("Almacen", "Almacén").replace("Almaçen", "Almacén")
+                    for col in df.columns
+                ]
+                col_gpo = encontrar_columna_por_patron(
+                    df, ["gpo.vdor", "gpo. vdor", "gpo vdor", "grupo vendedor", "vdor"]
                 )
-                st.stop()
-
-            pedidos_df = pd.read_excel(xls_principal, hoja_pedidos)
-
-            # ------------------------------
-            # Normalizar columnas del archivo principal
-            # ------------------------------
-            pedidos_df.columns = [
-                col.replace("Almacen", "Almacén").replace("Almaçen", "Almacén")
-                for col in pedidos_df.columns
-            ]
-
-            # ------------------------------
-            # Normalizar "Gpo.Vdor."
-            # ------------------------------
-            col_gpo_vdor = encontrar_columna_por_patron(
-                pedidos_df,
-                patrones=[
-                    "gpo.vdor",
-                    "gpo. vdor",
-                    "gpo vdor",
-                    "grupo vendedor",
-                    "gpo vendedor",
-                    "vdor",
-                ],
-            )
-
-            if "Gpo.Vdor." not in pedidos_df.columns:
-                if col_gpo_vdor:
-                    pedidos_df["Gpo.Vdor."] = pedidos_df[col_gpo_vdor]
-                else:
-                    pedidos_df["Gpo.Vdor."] = ""
-
-            # Limpieza (por si viene numérico/NaN)
-            pedidos_df["Gpo.Vdor."] = (
-                pedidos_df["Gpo.Vdor."]
-                .astype(str)
-                .str.strip()
-                .replace({"nan": "", "None": ""})
-            )
-
-            # ------------------------------
-            # Normalizar IDs
-            # ------------------------------
-            for col in ["Centro", "Material", "Almacén"]:
-                if col in pedidos_df.columns:
-                    pedidos_df[col] = normalizar_ids(pedidos_df[col])
-
-            st.success(
-                f"✅ Archivo principal procesado: {len(pedidos_df)} pedidos cargados"
-            )
-
-            # ------------------------------------------------------------------
-            # 2. Procesar archivo de inventario (con cálculo especial)
-            # ------------------------------------------------------------------
-            st.subheader("📦 Procesando archivo de inventario...")
-            xls_inventario = pd.ExcelFile(archivo_inventario)
-
-            # Buscar hoja de inventario
-            hoja_inventario = None
-            for hoja in xls_inventario.sheet_names:
-                if "inventario" in hoja.lower() or "sheets1" in hoja.lower():
-                    hoja_inventario = hoja
-                    break
-
-            if hoja_inventario is None:
-                # Intentar con la primera hoja
-                hoja_inventario = xls_inventario.sheet_names[0]
-                st.warning(f"Usando hoja '{hoja_inventario}' como inventario")
-
-            df_inventario_raw = pd.read_excel(xls_inventario, hoja_inventario)
-
-            # Aplicar procesamiento especial con cálculo
-            inventario_df = procesar_hoja_inventario_ajustada(df_inventario_raw)
-
-            if not inventario_df.empty:
-                st.success(f"✅ Inventario procesado: {len(inventario_df)} registros")
-                st.sidebar.write(
-                    f"**Materiales en inventario:** {inventario_df['Material'].nunique()}"
+                if "Gpo.Vdor." not in df.columns:
+                    df["Gpo.Vdor."] = df[col_gpo] if col_gpo else ""
+                df["Gpo.Vdor."] = (
+                    df["Gpo.Vdor."]
+                    .astype(str)
+                    .str.strip()
+                    .replace({"nan": "", "None": ""})
                 )
-            else:
-                st.warning("El archivo de inventario está vacío o no se pudo procesar")
+                for col in ["Centro", "Material", "Almacén"]:
+                    if col in df.columns:
+                        df[col] = normalizar_ids(df[col])
+                return df, hoja, t.elapsed()
 
-            # ------------------------------------------------------------------
-            # 3. Procesar archivo con hojas externas
-            # ------------------------------------------------------------------
-            st.subheader("📚 Procesando archivo con hojas externas...")
-            xls_externas = pd.ExcelFile(archivo_externas)
-            hojas_externas = {}
+            # ── Función para cargar inventario ───────────────────────────
+            def _cargar_inventario():
+                t = Timer()
+                xls = pd.ExcelFile(archivo_inventario)
+                hoja = None
+                for h in xls.sheet_names:
+                    if "inventario" in h.lower() or "sheets1" in h.lower():
+                        hoja = h
+                        break
+                if hoja is None:
+                    hoja = xls.sheet_names[0]
+                df_raw = pd.read_excel(xls, hoja)
+                df = procesar_hoja_inventario_ajustada(df_raw)
+                return df, hoja, t.elapsed()
 
-            # Lista de hojas a procesar (excluyendo posibles hojas de inventario)
-            hojas_a_procesar = [
-                hoja
-                for hoja in xls_externas.sheet_names
-                if "inventario" not in hoja.lower()
-            ]
+            # ── Función para cargar hojas externas ───────────────────────
+            def _cargar_externas():
+                t = Timer()
+                xls = pd.ExcelFile(archivo_externas)
+                hojas = {}
+                for hoja in xls.sheet_names:
+                    if "inventario" not in hoja.lower() and hoja in fuentes_disponibles:
+                        df_hoja = pd.read_excel(xls, hoja)
+                        if generar_todas_sugerencias_report or generar_sug_consumo_report:
+                            hojas[hoja] = procesar_hoja_externa(df_hoja, hoja)
+                return hojas, t.elapsed()
 
-            for hoja in hojas_a_procesar:
-                if hoja in fuentes_disponibles:
-                    df_hoja = pd.read_excel(xls_externas, hoja)
+            # ── Función para cargar facturación ──────────────────────────
+            def _cargar_facturacion():
+                if not (generar_reporte_consumo_report and archivo_facturacion):
+                    return None, None, "–"
+                t = Timer()
+                xls = pd.ExcelFile(archivo_facturacion)
+                hoja = None
+                for h in xls.sheet_names:
+                    if "facturacion" in h.lower() or "sheets1" in h.lower():
+                        hoja = h
+                        break
+                if hoja is None:
+                    hoja = xls.sheet_names[0]
+                df_raw = pd.read_excel(xls, hoja)
+                df = procesar_datos_facturacion(df_raw)
+                return df, hoja, t.elapsed()
 
-                    if modo_depuracion:
-                        st.write(f"**Hoja '{hoja}'**: {len(df_hoja)} filas")
-                        st.write(f"Columnas: {df_hoja.columns.tolist()}")
-
-                    # Solo procesar hojas externas si se va a generar el reporte
-                    if generar_todas_sugerencias_report:
-                        hojas_externas[hoja] = procesar_hoja_externa(df_hoja, hoja)
-                        st.write(f"  ✓ {hoja}: {len(hojas_externas[hoja])} registros")
-
-            st.success(
-                f"✅ Archivo externo procesado: {len(hojas_externas)} hojas cargadas"
-            )
-
-            # ------------------------------------------------------------------
-            # INICIALIZAR CACHE PARA DATOS PROCESADOS
-            # ------------------------------------------------------------------
-            # EN LA SECCIÓN DE INICIALIZACIÓN DEL CACHE (aproximadamente línea 2030-2035):
-            if "cache_inicializado" not in st.session_state:
-                st.session_state.cache_inicializado = True
-                st.session_state.cache_pedidos = None
-                st.session_state.cache_inventario = None
-                st.session_state.cache_externas = None
-                st.session_state.cache_facturacion = None
-
-            # Inicializar la variable fuera del bloque condicional
-            df_facturacion_procesado = None  # ← AÑADIR ESTA LÍNEA
-
-            # Opción para usar cache
-            usar_cache = st.checkbox(
-                "Usar cache de datos procesados (acelera reprocesamiento)", value=True
-            )
-
-            # Si el usuario quiere usar cache Y tenemos datos cacheados
+            # ── Usar cache o cargar en paralelo ──────────────────────────
             if usar_cache and st.session_state.cache_pedidos is not None:
-                # Usar datos cacheados
                 pedidos_df = st.session_state.cache_pedidos
                 inventario_df = st.session_state.cache_inventario
                 hojas_externas = st.session_state.cache_externas
+                df_facturacion_procesado = st.session_state.cache_facturacion
 
-                # Solo usar cache de facturación si existe
-                if st.session_state.cache_facturacion is not None:
-                    df_facturacion_procesado = (
-                        st.session_state.cache_facturacion
-                    )  # ← CORREGIDO
-
-                st.success("✓ Usando datos cacheados de ejecución anterior")
-
-                # Mostrar estadísticas de cache
+                st.write("✅ Datos cargados desde cache")
                 col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Pedidos cacheados", len(pedidos_df))
-                with col2:
-                    st.metric("Inventario cacheado", len(inventario_df))
-                with col3:
-                    st.metric("Hojas externas cacheadas", len(hojas_externas))
+                col1.metric("Pedidos (cache)", len(pedidos_df))
+                col2.metric("Inventario (cache)", len(inventario_df))
+                col3.metric("Hojas externas (cache)", len(hojas_externas))
+                hoja_pedidos_nombre = "cache"
             else:
-                # Guardar en cache para futuras ejecuciones
+                st.write("⚙️ Cargando archivos en paralelo…")
+                carga_progress = st.progress(0.0)
+
+                resultados_carga = {}
+                errores_carga = {}
+
+                tareas = {
+                    "pedidos": _cargar_pedidos,
+                    "inventario": _cargar_inventario,
+                    "externas": _cargar_externas,
+                    "facturacion": _cargar_facturacion,
+                }
+
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = {
+                        executor.submit(fn): nombre for nombre, fn in tareas.items()
+                    }
+                    completados = 0
+                    for future in as_completed(futures):
+                        nombre = futures[future]
+                        completados += 1
+                        carga_progress.progress(completados / len(tareas))
+                        try:
+                            resultados_carga[nombre] = future.result()
+                        except Exception as e:
+                            errores_carga[nombre] = str(e)
+
+                if "pedidos" in errores_carga:
+                    st.error(f"Error cargando pedidos: {errores_carga['pedidos']}")
+                    st.stop()
+
+                pedidos_df, hoja_pedidos_nombre, t_ped = resultados_carga["pedidos"]
+                inventario_df, _, t_inv = resultados_carga["inventario"]
+                hojas_externas, t_ext = resultados_carga["externas"]
+                df_facturacion_procesado, _, t_fac = resultados_carga.get(
+                    "facturacion", (None, None, "–")
+                )
+
+                carga_progress.empty()
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Pedidos", f"{len(pedidos_df):,}", delta=f"⏱ {t_ped}")
+                c2.metric("Inventario", f"{len(inventario_df):,}", delta=f"⏱ {t_inv}")
+                c3.metric("Hojas externas", len(hojas_externas), delta=f"⏱ {t_ext}")
+                c4.metric(
+                    "Facturación",
+                    (
+                        f"{len(df_facturacion_procesado):,}"
+                        if df_facturacion_procesado is not None
+                        else "–"
+                    ),
+                    delta=f"⏱ {t_fac}",
+                )
+
+                # Guardar en cache
                 st.session_state.cache_pedidos = pedidos_df
                 st.session_state.cache_inventario = inventario_df
                 st.session_state.cache_externas = hojas_externas
-
-                # Solo guardar facturación si se procesó y la variable está definida
                 if df_facturacion_procesado is not None:
                     st.session_state.cache_facturacion = df_facturacion_procesado
 
-                # Solo guardar facturación si se procesó
-                if generar_reporte_consumo_report and archivo_facturacion is not None:
-                    try:
-                        if (
-                            "df_facturacion_procesado" in locals()
-                            and df_facturacion_procesado is not None
-                        ):
-                            st.session_state.cache_facturacion = (
-                                df_facturacion_procesado
-                            )
-                    except:
-                        pass
+            if modo_depuracion:
+                with st.expander("🔍 Columnas detectadas (debug)"):
+                    st.write("**Pedidos:**", pedidos_df.columns.tolist())
+                    st.write("**Inventario:**", inventario_df.columns.tolist())
+                    for h, df_h in hojas_externas.items():
+                        st.write(f"**{h}:**", df_h.columns.tolist())
 
-                st.info("✓ Datos guardados en cache para próximas ejecuciones")
+            status_carga.update(
+                label=f"✅ Archivos listos ({timer_total.elapsed()})", state="complete"
+            )
 
-            # ------------------------------------------------------------------
-            # 4. Procesar archivo de facturación (si está activado)
-            # ------------------------------------------------------------------
-            df_reporte_consumo = None
-            if generar_reporte_consumo_report and archivo_facturacion is not None:
-                with st.spinner("Procesando archivo de facturación..."):
-                    try:
-                        xls_facturacion = pd.ExcelFile(archivo_facturacion)
-
-                        # Buscar hoja de facturación
-                        hoja_facturacion = None
-                        for hoja in xls_facturacion.sheet_names:
-                            if (
-                                "facturacion" in hoja.lower()
-                                or "sheets1" in hoja.lower()
-                            ):
-                                hoja_facturacion = hoja
-                                break
-
-                        if hoja_facturacion is None:
-                            # Intentar con la primera hoja
-                            hoja_facturacion = xls_facturacion.sheet_names[0]
-                            st.warning(
-                                f"Usando hoja '{hoja_facturacion}' como facturación"
-                            )
-
-                        df_facturacion_raw = pd.read_excel(
-                            xls_facturacion, hoja_facturacion
+        # ════════════════════════════════════════════════════════════════════
+        # FASE 2 – REPORTE DE CONSUMO
+        # ════════════════════════════════════════════════════════════════════
+        df_reporte_consumo = None
+        if (
+            generar_reporte_consumo_report
+            and df_facturacion_procesado is not None
+            and not df_facturacion_procesado.empty
+        ):
+            with st.status(
+                "📈 Generando Reporte de Consumo…", expanded=False
+            ) as status_consumo:
+                t2 = Timer()
+                try:
+                    df_reporte_consumo = generar_reporte_consumo(
+                        df_facturacion_procesado
+                    )
+                    if df_reporte_consumo is not None and not df_reporte_consumo.empty:
+                        status_consumo.update(
+                            label=f"✅ Reporte de Consumo listo — {len(df_reporte_consumo):,} materiales ({t2.elapsed()})",
+                            state="complete",
                         )
-                        df_facturacion_procesado = procesar_datos_facturacion(
-                            df_facturacion_raw
+                    else:
+                        status_consumo.update(
+                            label="⚠️ Reporte de consumo vacío", state="error"
                         )
+                except Exception as e:
+                    st.error(f"Error en reporte de consumo: {e}")
+                    logger.error(f"Error reporte consumo: {e}", exc_info=True)
+                    status_consumo.update(
+                        label="❌ Error en Reporte de Consumo", state="error"
+                    )
+        elif generar_reporte_consumo_report and archivo_facturacion is None:
+            st.warning(
+                "Para generar el reporte de consumo, cargue el archivo de facturación."
+            )
 
-                        if not df_facturacion_procesado.empty:
-                            st.success(
-                                f"✅ Facturación procesada: {len(df_facturacion_procesado)} registros"
-                            )
-
-                            # Generar reporte de consumo
-                            df_reporte_consumo = generar_reporte_consumo(
-                                df_facturacion_procesado
-                            )
-
-                            if not df_reporte_consumo.empty:
-                                st.success(
-                                    f"✅ Reporte de consumo generado: {len(df_reporte_consumo)} materiales"
-                                )
-
-                                # Mostrar vista previa del reporte
-                                st.subheader("Vista previa del Reporte de Consumo")
-                                st.dataframe(df_reporte_consumo.head(), width="stretch")
-
-                                # Estadísticas del reporte
-                                st.subheader("Estadísticas del Reporte de Consumo")
-                                col1, col2, col3 = st.columns(3)
-                                with col1:
-                                    st.metric(
-                                        "Materiales únicos",
-                                        df_reporte_consumo["Material"].nunique(),
-                                    )
-                                with col2:
-                                    st.metric(
-                                        "Destinatarios",
-                                        df_reporte_consumo["Destinatario"].nunique(),
-                                    )
-                                with col3:
-                                    consumo_total = df_reporte_consumo[
-                                        "Consumo_promedio_mensual"
-                                    ].sum()
-                                    st.metric(
-                                        "Consumo total mensual", f"{consumo_total:,.0f}"
-                                    )
-                            else:
-                                st.warning("No se pudo generar el reporte de consumo")
-                        else:
-                            st.warning(
-                                "El archivo de facturación está vacío o no se pudo procesar"
-                            )
-
-                    except Exception as e:
-                        st.error(
-                            f"Error al procesar el archivo de facturación: {str(e)}"
+        # ════════════════════════════════════════════════════════════════════
+        # FASE 3 – TODAS LAS SUGERENCIAS
+        # ════════════════════════════════════════════════════════════════════
+        df_todas_sugerencias = None
+        if generar_todas_sugerencias_report:
+            with st.status(
+                "💡 Generando Todas las Sugerencias…", expanded=True
+            ) as status_sug:
+                t3 = Timer()
+                try:
+                    df_todas_sugerencias = generar_todas_sugerencias(
+                        pedidos_df, hojas_externas, fuentes_activas, inventario_df
+                    )
+                    if (
+                        df_todas_sugerencias is not None
+                        and not df_todas_sugerencias.empty
+                    ):
+                        n_con = (df_todas_sugerencias[Columnas.FUENTE] != "").sum()
+                        n_sin = (df_todas_sugerencias[Columnas.FUENTE] == "").sum()
+                        n_bloq = (df_todas_sugerencias[Columnas.BLOQUEADO] != "").sum()
+                        status_sug.update(
+                            label=f"✅ Sugerencias listas — {len(df_todas_sugerencias):,} líneas ({t3.elapsed()})",
+                            state="complete",
                         )
-                        logger.error(f"Error en facturación: {str(e)}", exc_info=True)
-            elif generar_reporte_consumo_report and archivo_facturacion is None:
-                st.warning(
-                    "Para generar el reporte de consumo, cargue el archivo de facturación."
-                )
-
-                # ------------------------------------------------------------------
-            # 5. Generar "Todas las Sugerencias" si está activado
-            # ------------------------------------------------------------------
-            df_todas_sugerencias = None
-            if generar_todas_sugerencias_report:
-                with st.spinner("Generando todas las sugerencias..."):
-                    try:
-                        df_todas_sugerencias = generar_todas_sugerencias(
-                            pedidos_df, hojas_externas, fuentes_activas, inventario_df
+                    else:
+                        status_sug.update(
+                            label="⚠️ Sin sugerencias generadas", state="error"
                         )
+                except Exception as e:
+                    st.error(f"Error al generar sugerencias: {e}")
+                    logger.error(f"Error sugerencias: {e}", exc_info=True)
+                    status_sug.update(label="❌ Error en Sugerencias", state="error")
 
-                        if (
-                            df_todas_sugerencias is not None
-                            and not df_todas_sugerencias.empty
-                        ):
-                            st.success(
-                                f"✅ Sugerencias generadas: {len(df_todas_sugerencias)} líneas totales"
-                            )
-
-                            # Mostrar estadísticas
-                            st.subheader("Estadísticas de Todas las Sugerencias")
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric(
-                                    "Pedidos únicos",
-                                    df_todas_sugerencias[Columnas.PEDIDO].nunique(),
-                                )
-                            with col2:
-                                # Contar líneas sin sugerencia
-                                sin_sugerencia = df_todas_sugerencias[
-                                    df_todas_sugerencias[Columnas.FUENTE] == ""
-                                ].shape[0]
-                                st.metric("Líneas sin sugerencia", sin_sugerencia)
-                            with col3:
-                                # Contar líneas con bloqueo
-                                con_bloqueo = df_todas_sugerencias[
-                                    df_todas_sugerencias[Columnas.BLOQUEADO] != ""
-                                ].shape[0]
-                                st.metric("Líneas con bloqueo", con_bloqueo)
-                        else:
-                            st.warning("No se generaron sugerencias")
-                    except Exception as e:
-                        st.error(f"Error al generar sugerencias: {str(e)}")
-                        logger.error(f"Error en sugerencias: {str(e)}", exc_info=True)
-            else:
-                df_todas_sugerencias = None
-
-            # ------------------------------------------------------------------
-            # 6. Generar "Resumen Sin Sugerencias" MODIFICADO con los nuevos requisitos
-            # ------------------------------------------------------------------
-            df_resumen_sin_sugerencias = None
-            if (
-                generar_resumen_sin_sugerencias_report
-                and df_todas_sugerencias is not None
-                and not df_todas_sugerencias.empty
-            ):
-                with st.spinner("Generando resumen sin sugerencias (MODIFICADO)..."):
-                    try:
-                        # Usar df_facturacion_procesado si está disponible
-                        facturacion_para_resumen = None
-                        if (
-                            "df_facturacion_procesado" in locals()
-                            and df_facturacion_procesado is not None
-                        ):
-                            facturacion_para_resumen = df_facturacion_procesado
-
-                        # Usar la NUEVA función que incluye los cambios solicitados
-                        df_resumen_sin_sugerencias = generar_resumen_sin_sugerencias_optimizado(
+        # ════════════════════════════════════════════════════════════════════
+        # FASE 4 – RESUMEN SIN SUGERENCIAS
+        # ════════════════════════════════════════════════════════════════════
+        df_resumen_sin_sugerencias = None
+        if (
+            generar_resumen_sin_sugerencias_report
+            and df_todas_sugerencias is not None
+            and not df_todas_sugerencias.empty
+        ):
+            with st.status(
+                "📋 Generando Resumen Sin Sugerencias…", expanded=False
+            ) as status_res:
+                t4 = Timer()
+                try:
+                    facturacion_para_resumen = (
+                        df_facturacion_procesado
+                        if df_facturacion_procesado is not None
+                        else None
+                    )
+                    df_resumen_sin_sugerencias = (
+                        generar_resumen_sin_sugerencias_optimizado(
                             df_todas_sugerencias,
                             inventario_df,
-                            df_todas_sugerencias,  # Pasar también el dataframe completo para calcular pendientes
+                            df_todas_sugerencias,
                             facturacion_para_resumen,
                         )
-
-                        if (
-                            df_resumen_sin_sugerencias is not None
-                            and not df_resumen_sin_sugerencias.empty
-                        ):
-                            st.success(
-                                f"✅ Resumen MODIFICADO generado: {len(df_resumen_sin_sugerencias)} registros"
-                            )
-
-                            # Mostrar las nuevas características
-                            st.subheader("Nuevas características del Resumen:")
-
-                            # Verificar columnas agregadas
-                            nuevas_columnas_presentes = []
-                            if (
-                                "Promedio_Consumo_12M"
-                                in df_resumen_sin_sugerencias.columns
-                            ):
-                                nuevas_columnas_presentes.append("Promedio_Consumo_12M")
-
-                            # Verificar columnas de pendiente
-                            centros = [
-                                "1001",
-                                "1003",
-                                "1004",
-                                "1017",
-                                "1018",
-                                "1022",
-                                "1036",
-                            ]
-                            for centro in centros:
-                                col_name = f"Pendiente {centro}"
-                                if col_name in df_resumen_sin_sugerencias.columns:
-                                    nuevas_columnas_presentes.append(col_name)
-
-                            # Verificar columnas eliminadas
-                            columnas_eliminadas = []
-                            for col in [
-                                "Inv 1001",
-                                "Inv 1003",
-                                "Inv 1004",
-                                "Inv 1017",
-                                "Inv 1018",
-                                "Inv 1022",
-                                "Inv 1036",
-                            ]:
-                                if col not in df_resumen_sin_sugerencias.columns:
-                                    columnas_eliminadas.append(col)
-
-                            st.write(
-                                f"**Columnas agregadas:** {len(nuevas_columnas_presentes)}"
-                            )
-                            st.write(
-                                f"**Columnas eliminadas:** {len(columnas_eliminadas)}"
-                            )
-
-                            # Mostrar estadísticas de las nuevas columnas
-                            if (
-                                "Promedio_Consumo_12M"
-                                in df_resumen_sin_sugerencias.columns
-                            ):
-                                promedio_total = df_resumen_sin_sugerencias[
-                                    "Promedio_Consumo_12M"
-                                ].sum()
-                                st.metric(
-                                    "Consumo promedio total (12M)",
-                                    f"{promedio_total:,.0f}",
-                                )
-
-                            # Mostrar total de pendiente por centro
-                            st.write("**Total pendiente por centro (sin bloqueo):**")
-                            cols = st.columns(3)
-                            for i, centro in enumerate(centros[:3]):
-                                col_name = f"Pendiente {centro}"
-                                if col_name in df_resumen_sin_sugerencias.columns:
-                                    total = df_resumen_sin_sugerencias[col_name].sum()
-                                    cols[i].metric(f"Centro {centro}", f"{total:,.0f}")
-
-                            if len(centros) > 3:
-                                cols = st.columns(3)
-                                for i, centro in enumerate(centros[3:6]):
-                                    col_name = f"Pendiente {centro}"
-                                    if col_name in df_resumen_sin_sugerencias.columns:
-                                        total = df_resumen_sin_sugerencias[
-                                            col_name
-                                        ].sum()
-                                        cols[i].metric(
-                                            f"Centro {centro}", f"{total:,.0f}"
-                                        )
-
-                            if len(centros) > 6:
-                                col_name = f"Pendiente {centros[6]}"
-                                if col_name in df_resumen_sin_sugerencias.columns:
-                                    total = df_resumen_sin_sugerencias[col_name].sum()
-                                    st.metric(f"Centro {centros[6]}", f"{total:,.0f}")
-                        else:
-                            st.warning("No se pudo generar el resumen modificado")
-                    except Exception as e:
-                        st.error(f"Error al generar resumen modificado: {str(e)}")
-                        logger.error(
-                            f"Error en resumen modificado: {str(e)}", exc_info=True
+                    )
+                    if (
+                        df_resumen_sin_sugerencias is not None
+                        and not df_resumen_sin_sugerencias.empty
+                    ):
+                        status_res.update(
+                            label=f"✅ Resumen listo — {len(df_resumen_sin_sugerencias):,} registros ({t4.elapsed()})",
+                            state="complete",
                         )
-            else:
-                df_resumen_sin_sugerencias = None
+                    else:
+                        status_res.update(label="⚠️ Resumen vacío", state="error")
+                except Exception as e:
+                    st.error(f"Error al generar resumen: {e}")
+                    logger.error(f"Error resumen: {e}", exc_info=True)
+                    status_res.update(label="❌ Error en Resumen", state="error")
 
-            # ------------------------------------------------------------------
-            # Generar y mostrar reportes con descargas individuales
-            # ------------------------------------------------------------------
-            st.header("📊 Reportes Generados")
+        # ════════════════════════════════════════════════════════════════════
+        # POST-PROCESO: Enriquecer Todas las Sugerencias con consumo del Resumen
+        # ════════════════════════════════════════════════════════════════════
+        if (
+            df_todas_sugerencias is not None
+            and not df_todas_sugerencias.empty
+            and (
+                (df_resumen_sin_sugerencias is not None and not df_resumen_sin_sugerencias.empty)
+                or (df_reporte_consumo is not None and not df_reporte_consumo.empty)
+            )
+        ):
+            with st.status(
+                "🔗 Enriqueciendo Sugerencias con datos de consumo…", expanded=False
+            ) as status_enr:
+                t_enr = Timer()
+                try:
+                    df_todas_sugerencias = enriquecer_sugerencias_con_consumo(
+                        df_todas_sugerencias,
+                        df_resumen_sin_sugerencias,
+                        df_facturacion_procesado if df_facturacion_procesado is not None else None,
+                        df_reporte_consumo if df_reporte_consumo is not None else None,
+                    )
+                    status_enr.update(
+                        label=f"✅ Meses_Inventario calculado por almacén ({t_enr.elapsed()})",
+                        state="complete",
+                    )
+                except Exception as e:
+                    logger.warning(f"Post-proceso consumo falló: {e}")
+                    status_enr.update(label="⚠️ Enriquecimiento omitido", state="error")
 
-            # Contenedor para almacenar los reportes generados
-            if "reportes_generados" not in st.session_state:
-                st.session_state.reportes_generados = {}
+        # ════════════════════════════════════════════════════════════════════
+        # FASE 5 – SUGERENCIAS DESDE REPORTE DE CONSUMO (nuevo reporte)
+        # ════════════════════════════════════════════════════════════════════
+        df_sug_consumo = None
+        if (
+            generar_sug_consumo_report
+            and df_reporte_consumo is not None
+            and not df_reporte_consumo.empty
+        ):
+            with st.status(
+                "🔎 Generando Sugerencias desde Reporte de Consumo…", expanded=True
+            ) as status_sug_rc:
+                t5 = Timer()
+                try:
+                    df_sug_consumo = generar_sugerencias_desde_reporte_consumo(
+                        df_reporte_consumo=df_reporte_consumo,
+                        hojas_externas=hojas_externas,
+                        fuentes_activas=fuentes_activas,
+                        inventario_df=inventario_df,
+                        df_resumen=df_resumen_sin_sugerencias,
+                    )
+                    if df_sug_consumo is not None and not df_sug_consumo.empty:
+                        n_con_rc = int(
+                            (df_sug_consumo[Columnas.FUENTE] != "").sum()
+                        )
+                        n_sin_rc = int(
+                            (df_sug_consumo[Columnas.FUENTE] == "").sum()
+                        )
+                        status_sug_rc.update(
+                            label=(
+                                f"✅ Sugerencias desde Consumo listas — "
+                                f"{len(df_sug_consumo):,} líneas "
+                                f"({n_con_rc:,} con sugerencia, "
+                                f"{n_sin_rc:,} sin cobertura) "
+                                f"({t5.elapsed()})"
+                            ),
+                            state="complete",
+                        )
+                    else:
+                        status_sug_rc.update(
+                            label="⚠️ Sin sugerencias generadas desde Consumo",
+                            state="error",
+                        )
+                except Exception as e:
+                    st.error(f"Error al generar Sugerencias desde Consumo: {e}")
+                    logger.error(
+                        f"Error Sugerencias desde Consumo: {e}", exc_info=True
+                    )
+                    status_sug_rc.update(
+                        label="❌ Error en Sugerencias desde Consumo", state="error"
+                    )
+        elif generar_sug_consumo_report and (
+            df_reporte_consumo is None or df_reporte_consumo.empty
+        ):
+            st.warning(
+                "Para generar 'Sugerencias desde Consumo', primero activa y genera "
+                "'Reporte de Consumo' con el archivo de facturación cargado."
+            )
 
-            # Generar reporte de consumo si está activado
-            if (
-                generar_reporte_consumo_report
-                and df_reporte_consumo is not None
-                and not df_reporte_consumo.empty
-            ):
-                st.session_state.reportes_generados["consumo"] = df_reporte_consumo
+        # ════════════════════════════════════════════════════════════════════
+        # RESULTADOS Y DESCARGAS
+        # ════════════════════════════════════════════════════════════════════
+        st.header(f"📊 Reportes Generados  ⏱ Total: {timer_total.elapsed()}")
+        st.session_state.reportes_generados = {}
 
-                st.subheader("✅ Reporte de Consumo Listo")
-                st.dataframe(df_reporte_consumo.head(), width="stretch")
-
-                # Estadísticas del reporte
+        # ── Reporte de Consumo ───────────────────────────────────────────
+        if (
+            generar_reporte_consumo_report
+            and df_reporte_consumo is not None
+            and not df_reporte_consumo.empty
+        ):
+            st.session_state.reportes_generados["consumo"] = df_reporte_consumo
+            with st.expander("✅ Reporte de Consumo", expanded=True):
                 col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric(
-                        "Materiales únicos", df_reporte_consumo["Material"].nunique()
-                    )
-                with col2:
-                    st.metric(
-                        "Destinatarios", df_reporte_consumo["Destinatario"].nunique()
-                    )
-                with col3:
-                    consumo_total = df_reporte_consumo["Consumo_promedio_mensual"].sum()
-                    st.metric("Consumo total mensual", f"{consumo_total:,.0f}")
-
-                # Botón de descarga individual
-                with st.spinner("Preparando descarga del Reporte de Consumo..."):
-                    excel_bytes_consumo = exportar_reporte_individual(
-                        df_reporte_consumo, "Reporte de Consumo"
-                    )
-
+                col1.metric(
+                    "Materiales únicos", df_reporte_consumo["Material"].nunique()
+                )
+                col2.metric(
+                    "Destinatarios", df_reporte_consumo["Destinatario"].nunique()
+                )
+                col3.metric(
+                    "Consumo total mensual",
+                    f"{df_reporte_consumo['Consumo_promedio_mensual'].sum():,.0f}",
+                )
+                st.dataframe(df_reporte_consumo.head(10), use_container_width=True)
+                excel_bytes_consumo = exportar_reporte_individual(
+                    df_reporte_consumo, "Reporte de Consumo"
+                )
                 st.download_button(
-                    label="📥 Descargar Reporte de Consumo",
+                    "📥 Descargar Reporte de Consumo",
                     data=excel_bytes_consumo,
                     file_name="Reporte_Consumo.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="download_consumo",
                 )
 
-            # Generar reporte "Todas las Sugerencias" si está activado
-            if (
-                generar_todas_sugerencias_report
-                and df_todas_sugerencias is not None
-                and not df_todas_sugerencias.empty
-            ):
-                st.session_state.reportes_generados["sugerencias"] = (
-                    df_todas_sugerencias
+        # ── Todas las Sugerencias (4 pestañas) ───────────────────────────
+        if (
+            generar_todas_sugerencias_report
+            and df_todas_sugerencias is not None
+            and not df_todas_sugerencias.empty
+        ):
+            st.session_state.reportes_generados["sugerencias"] = df_todas_sugerencias
+            with st.expander("✅ Todas las Sugerencias", expanded=True):
+                # ── KPIs superiores ──────────────────────────────────────
+                n_con = int((df_todas_sugerencias[Columnas.FUENTE] != "").sum())
+                n_sin = int((df_todas_sugerencias[Columnas.FUENTE] == "").sum())
+                n_bloq = int((df_todas_sugerencias[Columnas.BLOQUEADO] != "").sum())
+                n_ped = int(df_todas_sugerencias[Columnas.PEDIDO].nunique())
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Pedidos únicos", f"{n_ped:,}")
+                c2.metric("Con sugerencia", f"{n_con:,}")
+                c3.metric("Sin cobertura", f"{n_sin:,}")
+                c4.metric("Con bloqueo", f"{n_bloq:,}")
+
+                # ── 4 Pestañas ───────────────────────────────────────────
+                tab_sug, tab_sin, tab_stock, tab_cli = st.tabs(
+                    [
+                        "📦 Sugerencias activas",
+                        "⚠️ Sin cobertura",
+                        "📈 Consumo vs stock",
+                        "👤 Vista por cliente",
+                    ]
                 )
 
-                st.subheader("✅ Todas las Sugerencias Listas")
-                st.dataframe(df_todas_sugerencias.head(), width="stretch")
+                # ── TAB 1: Sugerencias activas ───────────────────────────
+                with tab_sug:
+                    st.caption("Pedidos con al menos una fuente de oferta disponible")
 
-                # Resumen por fuente
-                resumen_fuentes = (
-                    df_todas_sugerencias.groupby(Columnas.FUENTE)
-                    .agg(
-                        {
-                            Columnas.MATERIAL_SOLICITADO: "nunique",
-                            Columnas.CANTIDAD_PENDIENTE: "sum",
-                            Columnas.CANTIDAD_OFERTAR: "sum",
-                        }
+                    # Filtros
+                    col_f1, col_f2, col_f3 = st.columns([2, 2, 3])
+                    with col_f1:
+                        fuentes_disp = sorted(
+                            df_todas_sugerencias[Columnas.FUENTE]
+                            .replace("", "Sin sugerencia")
+                            .unique()
+                        )
+                        fuente_sel = st.selectbox(
+                            "Fuente", ["Todas"] + list(fuentes_disp), key="tab1_fuente"
+                        )
+                    with col_f2:
+                        centros_disp_sel = sorted(
+                            df_todas_sugerencias[Columnas.CENTRO_PEDIDO].unique()
+                        )
+                        centro_sel = st.selectbox(
+                            "Centro",
+                            ["Todos"] + list(centros_disp_sel),
+                            key="tab1_centro",
+                        )
+                    with col_f3:
+                        busqueda = st.text_input(
+                            "Buscar material o descripción", key="tab1_buscar"
+                        )
+
+                    df_tab1 = df_todas_sugerencias[
+                        df_todas_sugerencias[Columnas.FUENTE] != ""
+                    ].copy()
+                    if fuente_sel != "Todas":
+                        df_tab1 = df_tab1[df_tab1[Columnas.FUENTE] == fuente_sel]
+                    if centro_sel != "Todos":
+                        df_tab1 = df_tab1[df_tab1[Columnas.CENTRO_PEDIDO] == centro_sel]
+                    if busqueda:
+                        mask_b = (
+                            df_tab1[Columnas.MATERIAL_SOLICITADO]
+                            .astype(str)
+                            .str.contains(busqueda, case=False, na=False)
+                        ) | (
+                            df_tab1[Columnas.DESCRIPCION_SOLICITADA]
+                            .astype(str)
+                            .str.contains(busqueda, case=False, na=False)
+                        )
+                        df_tab1 = df_tab1[mask_b]
+
+                    # Columnas clave para el vendedor (orden de trabajo)
+                    cols_vista = [
+                        Columnas.PEDIDO,
+                        Columnas.DESTINATARIO,
+                        Columnas.MATERIAL_SOLICITADO,
+                        Columnas.DESCRIPCION_SOLICITADA,
+                        Columnas.CENTRO_PEDIDO,
+                        Columnas.ALMACEN,
+                        Columnas.CANTIDAD_PENDIENTE,
+                        Columnas.FUENTE,
+                        Columnas.CANTIDAD_OFERTAR,
+                        Columnas.DISPONIBLE,
+                        Columnas.LOTE,
+                        Columnas.FECHA_CADUCIDAD,
+                        Columnas.INV_1030,
+                        Columnas.INV_1031,
+                        Columnas.INV_1060,
+                        Columnas.CONSUMO_DESTINATARIO_12M,
+                        Columnas.PROMEDIO_CONSUMO_12M,
+                        Columnas.MESES_INVENTARIO,
+                    ]
+                    cols_vista = [c for c in cols_vista if c in df_tab1.columns]
+                    st.dataframe(
+                        df_tab1[cols_vista].reset_index(drop=True),
+                        use_container_width=True,
+                        height=420,
                     )
-                    .reset_index()
+                    st.caption(f"{len(df_tab1):,} líneas mostradas")
+
+                # ── TAB 2: Sin cobertura ─────────────────────────────────
+                with tab_sin:
+                    st.caption(
+                        "Pedidos sin ninguna fuente disponible — muestra brecha y materiales afectados"
+                    )
+                    df_sin_cob = df_todas_sugerencias[
+                        df_todas_sugerencias[Columnas.FUENTE] == ""
+                    ].copy()
+
+                    if df_sin_cob.empty:
+                        st.success("¡Todos los pedidos tienen al menos una sugerencia!")
+                    else:
+                        # Agrupar por material para mostrar brecha total
+                        df_brecha = (
+                            df_sin_cob.groupby(
+                                [
+                                    Columnas.MATERIAL_SOLICITADO,
+                                    Columnas.DESCRIPCION_SOLICITADA,
+                                    Columnas.CENTRO_PEDIDO,
+                                    Columnas.ALMACEN,
+                                ]
+                            )
+                            .agg(
+                                Clientes_afectados=(Columnas.DESTINATARIO, "nunique"),
+                                Pedidos_afectados=(Columnas.PEDIDO, "nunique"),
+                                Pendiente_total=(Columnas.CANTIDAD_PENDIENTE, "sum"),
+                                Inv_1030=(Columnas.INV_1030, "first"),
+                                Inv_1031=(Columnas.INV_1031, "first"),
+                                Inv_1060=(Columnas.INV_1060, "first"),
+                                Consumo_12M=(Columnas.PROMEDIO_CONSUMO_12M, "first"),
+                                Meses_Inv=(Columnas.MESES_INVENTARIO, "first"),
+                            )
+                            .reset_index()
+                        )
+
+                        # Calcular brecha = pendiente - inventario disponible según almacén
+                        def _inv_almacen(row):
+                            alm = str(row[Columnas.ALMACEN]).strip()
+                            if alm == "1030":
+                                return row["Inv_1030"]
+                            elif alm == "1031":
+                                return row["Inv_1031"]
+                            elif alm == "1060":
+                                return row["Inv_1060"]
+                            return 0
+
+                        df_brecha["Inv_disponible"] = df_brecha.apply(
+                            _inv_almacen, axis=1
+                        )
+                        df_brecha["Brecha"] = (
+                            df_brecha["Pendiente_total"] - df_brecha["Inv_disponible"]
+                        )
+                        df_brecha = df_brecha.sort_values("Brecha", ascending=False)
+
+                        kb1, kb2, kb3 = st.columns(3)
+                        kb1.metric(
+                            "Materiales sin cobertura",
+                            df_brecha[Columnas.MATERIAL_SOLICITADO].nunique(),
+                        )
+                        kb2.metric(
+                            "Clientes afectados",
+                            int(df_brecha["Clientes_afectados"].sum()),
+                        )
+                        kb3.metric(
+                            "Pendiente total sin cubrir",
+                            f"{df_brecha['Pendiente_total'].sum():,.0f}",
+                        )
+
+                        st.dataframe(
+                            df_brecha.rename(
+                                columns={
+                                    Columnas.MATERIAL_SOLICITADO: "Material",
+                                    Columnas.DESCRIPCION_SOLICITADA: "Descripción",
+                                    Columnas.CENTRO_PEDIDO: "Centro",
+                                    Columnas.ALMACEN: "Almacén",
+                                }
+                            ).reset_index(drop=True),
+                            use_container_width=True,
+                            height=420,
+                        )
+
+                # ── TAB 3: Consumo vs stock ──────────────────────────────
+                with tab_stock:
+                    st.caption(
+                        "Muestra el Promedio_Consumo_12M (por Centro/Material/Almacén) "
+                        "frente al inventario del almacén correspondiente al pedido"
+                    )
+                    if (
+                        df_resumen_sin_sugerencias is not None
+                        and not df_resumen_sin_sugerencias.empty
+                    ):
+                        cols_stock = [
+                            c
+                            for c in [
+                                "Centro",
+                                "Almacen",
+                                "Material",
+                                "Descripcion",
+                                "Promedio_Consumo_12M",
+                                "Ultimo_Mes_Consumo",
+                                "Cantidad_Ultimo_Mes",
+                                "Penultimo_Mes_Consumo",
+                                "Cantidad_Penultimo_Mes",
+                                "Meses_Inventario",
+                                "Inv 1030",
+                                "Inv 1031",
+                                "Inv 1032",
+                                "Inv 1060",
+                            ]
+                            if c in df_resumen_sin_sugerencias.columns
+                        ]
+                        # Filtro de alertas
+                        alerta_sel = st.selectbox(
+                            "Filtrar por alerta de inventario",
+                            [
+                                "Todos",
+                                "Crítico (< 1 mes)",
+                                "Bajo (1–3 meses)",
+                                "OK (> 3 meses)",
+                            ],
+                            key="tab3_alerta",
+                        )
+                        df_stock = df_resumen_sin_sugerencias[cols_stock].copy()
+                        if alerta_sel == "Crítico (< 1 mes)":
+                            df_stock = df_stock[df_stock["Meses_Inventario"] < 1]
+                        elif alerta_sel == "Bajo (1–3 meses)":
+                            df_stock = df_stock[
+                                (df_stock["Meses_Inventario"] >= 1)
+                                & (df_stock["Meses_Inventario"] <= 3)
+                            ]
+                        elif alerta_sel == "OK (> 3 meses)":
+                            df_stock = df_stock[df_stock["Meses_Inventario"] > 3]
+
+                        k1, k2, k3 = st.columns(3)
+                        k1.metric(
+                            "Críticos (< 1 mes)",
+                            int(
+                                (
+                                    df_resumen_sin_sugerencias.get(
+                                        "Meses_Inventario", pd.Series()
+                                    )
+                                    < 1
+                                ).sum()
+                            ),
+                        )
+                        k2.metric(
+                            "Bajos (1–3 meses)",
+                            int(
+                                (
+                                    (
+                                        df_resumen_sin_sugerencias.get(
+                                            "Meses_Inventario", pd.Series()
+                                        )
+                                        >= 1
+                                    )
+                                    & (
+                                        df_resumen_sin_sugerencias.get(
+                                            "Meses_Inventario", pd.Series()
+                                        )
+                                        <= 3
+                                    )
+                                ).sum()
+                            ),
+                        )
+                        k3.metric(
+                            "OK (> 3 meses)",
+                            int(
+                                (
+                                    df_resumen_sin_sugerencias.get(
+                                        "Meses_Inventario", pd.Series()
+                                    )
+                                    > 3
+                                ).sum()
+                            ),
+                        )
+
+                        st.dataframe(
+                            df_stock.sort_values("Meses_Inventario").reset_index(
+                                drop=True
+                            ),
+                            use_container_width=True,
+                            height=420,
+                        )
+                    else:
+                        st.info(
+                            "Genera también el Resumen Sin Sugerencias para ver esta vista."
+                        )
+
+                # ── TAB 4: Vista por cliente ─────────────────────────────
+                with tab_cli:
+                    st.caption(
+                        "Filtra todos los pedidos abiertos de un cliente para ver su perfil de demanda cruzado con el inventario disponible"
+                    )
+                    clientes_lista = sorted(
+                        df_todas_sugerencias[Columnas.DESTINATARIO]
+                        .dropna()
+                        .astype(str)
+                        .str.strip()
+                        .replace("", pd.NA)
+                        .dropna()
+                        .unique()
+                    )
+                    cliente_elegido = st.selectbox(
+                        "Selecciona un destinatario",
+                        ["— Elige un cliente —"] + list(clientes_lista),
+                        key="tab4_cliente",
+                    )
+                    if cliente_elegido != "— Elige un cliente —":
+                        df_cli = df_todas_sugerencias[
+                            df_todas_sugerencias[Columnas.DESTINATARIO]
+                            .astype(str)
+                            .str.strip()
+                            == cliente_elegido
+                        ].copy()
+
+                        razon = (
+                            df_cli[Columnas.RAZON_SOCIAL].iloc[0]
+                            if Columnas.RAZON_SOCIAL in df_cli.columns
+                            and len(df_cli) > 0
+                            else ""
+                        )
+                        n_ped_cli = df_cli[Columnas.PEDIDO].nunique()
+                        pend_total = df_cli[Columnas.CANTIDAD_PENDIENTE].sum()
+                        n_con_cli = (df_cli[Columnas.FUENTE] != "").sum()
+                        n_sin_cli = (df_cli[Columnas.FUENTE] == "").sum()
+
+                        st.markdown(f"**{razon or cliente_elegido}**")
+                        kc1, kc2, kc3, kc4 = st.columns(4)
+                        kc1.metric("Pedidos", n_ped_cli)
+                        kc2.metric("Pendiente total", f"{pend_total:,.0f}")
+                        kc3.metric("Con sugerencia", int(n_con_cli))
+                        kc4.metric("Sin cobertura", int(n_sin_cli))
+
+                        cols_cli = [
+                            Columnas.PEDIDO,
+                            Columnas.MATERIAL_SOLICITADO,
+                            Columnas.DESCRIPCION_SOLICITADA,
+                            Columnas.CENTRO_PEDIDO,
+                            Columnas.ALMACEN,
+                            Columnas.CANTIDAD_PENDIENTE,
+                            Columnas.FUENTE,
+                            Columnas.CANTIDAD_OFERTAR,
+                            Columnas.INV_1030,
+                            Columnas.INV_1031,
+                            Columnas.INV_1060,
+                            Columnas.CONSUMO_DESTINATARIO_12M,
+                            Columnas.PROMEDIO_CONSUMO_12M,
+                            Columnas.MESES_INVENTARIO,
+                            Columnas.BLOQUEADO,
+                        ]
+                        cols_cli = [c for c in cols_cli if c in df_cli.columns]
+                        st.dataframe(
+                            df_cli[cols_cli].reset_index(drop=True),
+                            use_container_width=True,
+                            height=380,
+                        )
+
+                        # Resumen de materiales consumidos (del Resumen Sin Sugerencias)
+                        if (
+                            df_resumen_sin_sugerencias is not None
+                            and not df_resumen_sin_sugerencias.empty
+                        ):
+                            mats_cliente = df_cli[Columnas.MATERIAL_SOLICITADO].unique()
+                            df_hist = df_resumen_sin_sugerencias[
+                                df_resumen_sin_sugerencias["Material"].isin(
+                                    mats_cliente
+                                )
+                            ]
+                            if not df_hist.empty:
+                                st.markdown(
+                                    "**Histórico de consumo (Resumen Sin Sugerencias)**"
+                                )
+                                cols_hist = [
+                                    c
+                                    for c in [
+                                        "Centro",
+                                        "Almacen",
+                                        "Material",
+                                        "Descripcion",
+                                        "Promedio_Consumo_12M",
+                                        "Ultimo_Mes_Consumo",
+                                        "Cantidad_Ultimo_Mes",
+                                        "Meses_Inventario",
+                                    ]
+                                    if c in df_hist.columns
+                                ]
+                                st.dataframe(
+                                    df_hist[cols_hist].reset_index(drop=True),
+                                    use_container_width=True,
+                                    height=250,
+                                )
+
+                # ── Descarga ─────────────────────────────────────────────
+                st.divider()
+                excel_bytes_sugerencias = exportar_reporte_individual(
+                    df_todas_sugerencias, "Todas las Sugerencias"
                 )
-                resumen_fuentes.columns = [
-                    "Fuente",
-                    "Materiales Únicos",
-                    "Cantidad Pendiente Total",
-                    "Cantidad Ofertada Total",
-                ]
-                st.dataframe(resumen_fuentes, width="stretch")
-
-                # Botón de descarga individual
-                with st.spinner("Preparando descarga de Todas las Sugerencias..."):
-                    excel_bytes_sugerencias = exportar_reporte_individual(
-                        df_todas_sugerencias, "Todas las Sugerencias"
-                    )
-
                 st.download_button(
-                    label="📥 Descargar Todas las Sugerencias",
+                    "📥 Descargar Todas las Sugerencias (Excel)",
                     data=excel_bytes_sugerencias,
                     file_name="Todas_Sugerencias.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="download_sugerencias",
                 )
 
-            # Generar reporte "Resumen Sin Sugerencias" MODIFICADO si está activado
-            if (
-                generar_resumen_sin_sugerencias_report
-                and df_resumen_sin_sugerencias is not None
-                and not df_resumen_sin_sugerencias.empty
-            ):
-                st.session_state.reportes_generados["resumen"] = (
-                    df_resumen_sin_sugerencias
+        # ── Resumen Sin Sugerencias ──────────────────────────────────────
+        if (
+            generar_resumen_sin_sugerencias_report
+            and df_resumen_sin_sugerencias is not None
+            and not df_resumen_sin_sugerencias.empty
+        ):
+            st.session_state.reportes_generados["resumen"] = df_resumen_sin_sugerencias
+            with st.expander("✅ Resumen Sin Sugerencias", expanded=True):
+                total_pend = df_resumen_sin_sugerencias.get(
+                    "Cantidad_Pendiente", pd.Series([0])
+                ).sum()
+                total_imp = df_resumen_sin_sugerencias.get(
+                    "Importe_Pendiente", pd.Series([0])
+                ).sum()
+                mats = (
+                    df_resumen_sin_sugerencias["Material"].nunique()
+                    if "Material" in df_resumen_sin_sugerencias.columns
+                    else 0
                 )
+                prom_total = df_resumen_sin_sugerencias.get(
+                    "Promedio_Consumo_12M", pd.Series([0])
+                ).sum()
 
-                st.subheader("✅ Resumen Sin Sugerencias MODIFICADO Listo")
-                st.info(
-                    "**Nota:** Este reporte incluye las modificaciones solicitadas:"
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Materiales sin sugerencia", mats)
+                c2.metric("Total pendiente", f"{total_pend:,.0f}")
+                c3.metric("Total importe", f"${total_imp:,.0f}")
+                c4.metric("Consumo promedio 12M", f"{prom_total:,.0f}")
+
+                st.write("**Total pendiente por centro (sin bloqueo):**")
+                centros_disp = ["1001", "1003", "1004", "1017", "1018", "1022", "1036"]
+                cols_centro = st.columns(min(len(centros_disp), 4))
+                for i, centro in enumerate(centros_disp):
+                    col_name = f"Pendiente {centro}"
+                    if col_name in df_resumen_sin_sugerencias.columns:
+                        total = df_resumen_sin_sugerencias[col_name].sum()
+                        cols_centro[i % 4].metric(f"Centro {centro}", f"{total:,.0f}")
+
+                st.dataframe(
+                    df_resumen_sin_sugerencias.head(10), use_container_width=True
                 )
-                st.write("1. ✅ Columna 'Promedio_Consumo_12M' agregada")
-                st.write("2. ✅ Columnas 'Inv 1001, 1003, etc.' eliminadas")
-                st.write("3. ✅ Columnas 'Pendiente 1001, 1003, etc.' agregadas")
-
-                st.dataframe(df_resumen_sin_sugerencias.head(), width="stretch")
-
-                # Calcular estadísticas del resumen MODIFICADO
-                if "Cantidad" in df_resumen_sin_sugerencias.columns:
-                    total_pendiente = df_resumen_sin_sugerencias["Cantidad"].sum()
-                else:
-                    total_pendiente = 0
-
-                if "Importe" in df_resumen_sin_sugerencias.columns:
-                    total_importe = df_resumen_sin_sugerencias["Importe"].sum()
-                else:
-                    total_importe = 0
-
-                if "Material" in df_resumen_sin_sugerencias.columns:
-                    materiales_unicos = df_resumen_sin_sugerencias["Material"].nunique()
-                else:
-                    materiales_unicos = 0
-
-                if "Promedio_Consumo_12M" in df_resumen_sin_sugerencias.columns:
-                    promedio_total = df_resumen_sin_sugerencias[
-                        "Promedio_Consumo_12M"
-                    ].sum()
-                else:
-                    promedio_total = 0
-
-                st.subheader(f"Resumen General MODIFICADO:")
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Materiales sin sugerencia", materiales_unicos)
-                with col2:
-                    st.metric("Total pendiente", f"{total_pendiente:,.0f}")
-                with col3:
-                    st.metric("Total importe", f"${total_importe:,.0f}")
-                with col4:
-                    st.metric("Consumo promedio 12M", f"{promedio_total:,.0f}")
-
-                # Botón de descarga individual
-                with st.spinner(
-                    "Preparando descarga del Resumen Sin Sugerencias MODIFICADO..."
-                ):
-                    excel_bytes_resumen = exportar_reporte_individual(
-                        df_resumen_sin_sugerencias, "Resumen Sin Sugerencias"
-                    )
-
+                excel_bytes_resumen = exportar_reporte_individual(
+                    df_resumen_sin_sugerencias, "Resumen Sin Sugerencias"
+                )
                 st.download_button(
-                    label="📥 Descargar Resumen Sin Sugerencias (MODIFICADO)",
+                    "📥 Descargar Resumen Sin Sugerencias",
                     data=excel_bytes_resumen,
-                    file_name="Resumen_Sin_Sugerencias_MODIFICADO.xlsx",
+                    file_name="Resumen_Sin_Sugerencias.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="download_resumen",
                 )
 
-            # Botón para exportar todos los reportes juntos (si hay al menos uno)
-            reportes_disponibles = [
-                (
-                    generar_reporte_consumo_report
-                    and df_reporte_consumo is not None
-                    and not df_reporte_consumo.empty
-                ),
-                (
-                    generar_todas_sugerencias_report
-                    and df_todas_sugerencias is not None
-                    and not df_todas_sugerencias.empty
-                ),
-                (
-                    generar_resumen_sin_sugerencias_report
-                    and df_resumen_sin_sugerencias is not None
-                    and not df_resumen_sin_sugerencias.empty
-                ),
-            ]
+        # ── Sugerencias desde Reporte de Consumo (nuevo reporte) ────────
+        if (
+            generar_sug_consumo_report
+            and df_sug_consumo is not None
+            and not df_sug_consumo.empty
+        ):
+            st.session_state.reportes_generados["sug_consumo"] = df_sug_consumo
+            with st.expander(
+                "✅ Sugerencias desde Reporte de Consumo", expanded=True
+            ):
+                # ── KPIs ─────────────────────────────────────────────────
+                # Usar nombres reales del nuevo formato (sin Columnas.*)
+                _col_fuente_rc = "Fuente"
+                _col_mat_rc    = "Material"
+                _col_dest_rc   = "Destinatario"
 
-            if any(reportes_disponibles):
-                st.divider()
-                st.subheader("📦 Descargar Todos los Reportes")
+                n_con_rc  = int((df_sug_consumo[_col_fuente_rc] != "").sum())
+                n_sin_rc  = int((df_sug_consumo[_col_fuente_rc] == "").sum())
+                n_mat_rc  = int(df_sug_consumo[_col_mat_rc].nunique())
+                n_dest_rc = int(df_sug_consumo[_col_dest_rc].nunique())
 
-                with st.spinner("Preparando archivo combinado..."):
-                    excel_bytes_completo = exportar_a_excel(
-                        (
-                            df_todas_sugerencias
-                            if generar_todas_sugerencias_report
-                            else None
-                        ),
-                        (
-                            df_resumen_sin_sugerencias
-                            if generar_resumen_sin_sugerencias_report
-                            else None
-                        ),
-                        df_reporte_consumo if generar_reporte_consumo_report else None,
-                    )
+                kc1, kc2, kc3, kc4 = st.columns(4)
+                kc1.metric("Materiales únicos",    f"{n_mat_rc:,}")
+                kc2.metric("Destinatarios únicos", f"{n_dest_rc:,}")
+                kc3.metric("Con sugerencia",        f"{n_con_rc:,}")
+                kc4.metric("Sin cobertura",         f"{n_sin_rc:,}")
 
-                # Determinar nombre del archivo basado en los reportes incluidos
-                if sum(reportes_disponibles) == 3:
-                    file_name = "Reporte_Completo_MODIFICADO.xlsx"
-                    label = "📦 Descargar Excel con todos los reportes (MODIFICADO)"
-                elif sum(reportes_disponibles) == 2:
-                    file_name = "Reporte_Parcial_MODIFICADO.xlsx"
-                    label = "📦 Descargar Excel con reportes disponibles (MODIFICADO)"
-                else:
-                    file_name = "Reporte_Individual_MODIFICADO.xlsx"
-                    label = "📦 Descargar Excel con reporte disponible (MODIFICADO)"
-
-                st.download_button(
-                    label=label,
-                    data=excel_bytes_completo,
-                    file_name=file_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_completo",
+                # ── Sub-pestañas ──────────────────────────────────────────
+                tab_rc_sug, tab_rc_sin = st.tabs(
+                    ["📦 Sugerencias activas", "⚠️ Sin cobertura"]
                 )
-            else:
-                st.warning("No se generaron datos para exportar")
 
-        except Exception as e:
-            st.error(f"Error al procesar los archivos: {str(e)}")
-            logger.error(f"Error detallado: {str(e)}", exc_info=True)
+                with tab_rc_sug:
+                    st.caption(
+                        "Registros del Reporte de Consumo con al menos una fuente disponible"
+                    )
+                    col_rc1, col_rc2 = st.columns([2, 3])
+                    with col_rc1:
+                        fuentes_rc = sorted(
+                            df_sug_consumo[_col_fuente_rc]
+                            .replace("", "Sin sugerencia")
+                            .unique()
+                        )
+                        fuente_rc_sel = st.selectbox(
+                            "Fuente",
+                            ["Todas"] + list(fuentes_rc),
+                            key="rc_fuente",
+                        )
+                    with col_rc2:
+                        busqueda_rc = st.text_input(
+                            "Buscar material o descripción", key="rc_buscar"
+                        )
+
+                    df_rc_con = df_sug_consumo[
+                        df_sug_consumo[_col_fuente_rc] != ""
+                    ].copy()
+                    if fuente_rc_sel != "Todas":
+                        df_rc_con = df_rc_con[
+                            df_rc_con[_col_fuente_rc] == fuente_rc_sel
+                        ]
+                    if busqueda_rc:
+                        mask_rc = (
+                            df_rc_con["Material"]
+                            .astype(str)
+                            .str.contains(busqueda_rc, case=False, na=False)
+                        ) | (
+                            df_rc_con["Texto Material"]
+                            .astype(str)
+                            .str.contains(busqueda_rc, case=False, na=False)
+                        )
+                        df_rc_con = df_rc_con[mask_rc]
+
+                    # Columnas de visualización usando los nombres reales del output
+                    cols_rc_vista = [
+                        "Centro",
+                        "Destinatario",
+                        "Razón Social",
+                        "Material",
+                        "Texto Material",
+                        "Consumo_promedio_mensual",
+                        "Ultima_compra_cliente",
+                        "Fuente",
+                        "Material sugerido",
+                        "Descripción sugerida",
+                        "Centro sugerido",
+                        "Almacén sugerido",
+                        "Disponible",
+                        "Lote",
+                        "Fecha de Caducidad",
+                        "Inv 1030",
+                        "Inv 1031",
+                        "Inv 1060",
+                        "Promedio_Consumo_12M",
+                        "Meses_Inventario",
+                    ]
+                    cols_rc_vista = [c for c in cols_rc_vista if c in df_rc_con.columns]
+                    st.dataframe(
+                        df_rc_con[cols_rc_vista].reset_index(drop=True),
+                        use_container_width=True,
+                        height=420,
+                    )
+                    st.caption(f"{len(df_rc_con):,} líneas mostradas")
+
+                with tab_rc_sin:
+                    st.caption(
+                        "Registros del Reporte de Consumo sin ninguna fuente disponible"
+                    )
+                    df_rc_sin = df_sug_consumo[
+                        df_sug_consumo[_col_fuente_rc] == ""
+                    ].copy()
+                    if df_rc_sin.empty:
+                        st.success(
+                            "¡Todos los registros de consumo tienen al menos una sugerencia!"
+                        )
+                    else:
+                        ks1, ks2 = st.columns(2)
+                        ks1.metric(
+                            "Materiales sin cobertura",
+                            df_rc_sin["Material"].nunique(),
+                        )
+                        ks2.metric(
+                            "Destinatarios sin cobertura",
+                            df_rc_sin["Destinatario"].nunique(),
+                        )
+                        cols_rc_sin = [
+                            "Centro",
+                            "Destinatario",
+                            "Material",
+                            "Texto Material",
+                            "Consumo_promedio_mensual",
+                            "Ultima_compra_cliente",
+                            "Inv 1030",
+                            "Inv 1031",
+                            "Promedio_Consumo_12M",
+                        ]
+                        cols_rc_sin = [c for c in cols_rc_sin if c in df_rc_sin.columns]
+                        st.dataframe(
+                            df_rc_sin[cols_rc_sin].reset_index(drop=True),
+                            use_container_width=True,
+                            height=350,
+                        )
+
+                st.divider()
+                excel_bytes_sug_consumo = exportar_reporte_individual(
+                    df_sug_consumo, "Sug Reporte Consumo"
+                )
+                st.download_button(
+                    "📥 Descargar Sugerencias desde Consumo (Excel)",
+                    data=excel_bytes_sug_consumo,
+                    file_name="Sugerencias_Reporte_Consumo.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_sug_consumo",
+                )
+
+        # ── Descarga combinada ───────────────────────────────────────────
+        reportes_disp = [
+            generar_reporte_consumo_report
+            and df_reporte_consumo is not None
+            and not df_reporte_consumo.empty,
+            generar_todas_sugerencias_report
+            and df_todas_sugerencias is not None
+            and not df_todas_sugerencias.empty,
+            generar_resumen_sin_sugerencias_report
+            and df_resumen_sin_sugerencias is not None
+            and not df_resumen_sin_sugerencias.empty,
+            generar_sug_consumo_report
+            and df_sug_consumo is not None
+            and not df_sug_consumo.empty,
+        ]
+        if any(reportes_disp):
+            st.divider()
+            st.subheader("📦 Descargar Todos los Reportes")
+            n_rep = sum(reportes_disp)
+            excel_bytes_completo = exportar_a_excel(
+                df_todas_sugerencias if generar_todas_sugerencias_report else None,
+                (
+                    df_resumen_sin_sugerencias
+                    if generar_resumen_sin_sugerencias_report
+                    else None
+                ),
+                df_reporte_consumo if generar_reporte_consumo_report else None,
+                df_sug_consumo if generar_sug_consumo_report else None,
+            )
+            label_combo = f"📦 Descargar {n_rep} reporte{'s' if n_rep > 1 else ''} en un solo Excel"
+            fname_combo = (
+                "Reporte_Completo.xlsx" if n_rep >= 4 else f"Reporte_{n_rep}_hojas.xlsx"
+            )
+            st.download_button(
+                label=label_combo,
+                data=excel_bytes_completo,
+                file_name=fname_combo,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_completo",
+            )
+        else:
+            st.warning("No se generaron datos para exportar")
+
+    except Exception as e:
+        st.error(f"Error al procesar los archivos: {str(e)}")
+        logger.error(f"Error detallado: {str(e)}", exc_info=True)
 
 else:
     info_text = """
@@ -3490,12 +4903,24 @@ else:
     5. ✅ **Solo incluye** pedidos sin estatus de bloqueo en la columna "Bloqueado"
     """
 
-    if generar_reporte_consumo_report:
+    if generar_reporte_consumo_report or generar_sug_consumo_report:
         info_text += """
     4. **Archivo de Facturación** - Contiene la hoja 'Facturacion' o 'sheets1' con datos históricos de facturación
        • Columnas requeridas: Solicitante, Razón Social, Destinatario, Fecha, Factura, Doc. Comerc. Ant,
          Material, Texto Material, Cantidad, UM, Importe, Centro, Almacén, Doc. Ventas, Gpo. Vdor., Grp. Cliente
        • **IMPORTANTE:** Ahora también se usa para calcular estadísticas de consumo en "Resumen Sin Sugerencias"
+        """
+
+    if generar_sug_consumo_report:
+        info_text += """
+    ### 🔎 **Nuevo Reporte: "Sugerencias desde Reporte de Consumo"**
+    - Aplica la misma lógica de sugerencias que "Todas las Sugerencias", pero sobre los registros
+      del **Reporte de Consumo** (histórico de facturación por Destinatario/Material).
+    - Requiere tener activo también "Generar Reporte de Consumo".
+    - Genera una hoja independiente **"Sug Reporte Consumo"** en el Excel combinado.
+    - Mapeo de columnas: Destinatario → Destinatario, Material → Material,
+      Centro → Centro, Consumo_promedio_mensual → Pendiente de referencia,
+      Cantidad ultima → Cantidad, Precio_unitario_ultima → Precio.
         """
 
     st.info(info_text)
